@@ -1,0 +1,93 @@
+# OIDC × Client ID Metadata Document (CIMD) × Resource Indicators デモ
+
+[OAuth Client ID Metadata Document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) を手元で試すための最小構成です。
+**client_id が「クライアントのメタデータ JSON の URL」になり、OP への事前登録が不要になる** 仕組みを体験できます。
+さらに [Resource Indicators (RFC 8707)](https://www.rfc-editor.org/rfc/rfc8707) で、**アクセストークンの `aud` を API ごとに絞る** 動きも確認できます。
+
+## 起動
+
+```bash
+docker compose up -d
+docker compose logs -f   # OP がメタデータを取得する様子が見える
+```
+
+1. http://localhost:4000 を開く (クライアント / RP)
+2. 「OP でログイン」 → OP の同意画面 (alice / password が入力済み)
+3. 「許可」 → ID トークンと、API 呼び分けの結果 (①〜⑥) が表示される
+
+停止: `docker compose down`
+
+## 構成
+
+| サービス | URL | 役割 |
+|---|---|---|
+| client | http://localhost:4000 | RP。`/client-metadata.json` で自分のメタデータを公開 |
+| op | http://localhost:3000 | CIMD / RFC 8707 対応の OpenID Provider (自作・依存なし) |
+| api-a | http://localhost:5000 | リソースサーバー。`aud` に `http://localhost:5000` を含むトークンだけ受け付ける |
+| api-b | http://localhost:5001 | 同上 (`http://localhost:5001`) |
+
+いずれも依存パッケージなしの Node.js で、`start.js` が 1 つのコンテナ内で 4 プロセスとして起動します。
+
+## 流れ
+
+```
+Browser ──(1) /authorize?client_id=http://localhost:4000/client-metadata.json──▶ OP
+OP ──(2) GET http://localhost:4000/client-metadata.json──▶ Client
+OP: (3) 検証 → 同意画面に client_name / logo_uri / ドメインを表示
+Browser ──(4) code──▶ Client ──(5) /token (client_id + PKCE, シークレット無し)──▶ OP
+```
+
+OP が行う主なチェック (`op/server.js` の `getClientMetadata`):
+
+- client_id URL は https・パス必須・フラグメント/認証情報/dot segment 禁止
+- ドキュメント内の `client_id` が取得元 URL と **完全一致**
+- `client_secret` を含まない、`token_endpoint_auth_method` が `client_secret_*` でない
+- `redirect_uri` はドキュメントの `redirect_uris` と完全一致
+- サイズ上限 (5KB)、リダイレクト不可、タイムアウト、`Cache-Control: max-age` に従ってキャッシュ
+
+OP は discovery で `client_id_metadata_document_supported: true` を公開しています。
+
+## Resource Indicators (RFC 8707)
+
+```
+/authorize ?resource=http://localhost:5000&resource=http://localhost:5001   ← 両 API への同意を取る
+/token (code)          resource=http://localhost:5000  → AT(aud=5000) + refresh_token
+/token (refresh_token) resource=http://localhost:5001  → AT(aud=5001)
+```
+
+ログイン後の画面で以下を確認できます。
+
+| # | 内容 | 結果 |
+|---|---|---|
+| ① | 認可コード交換で `resource=API A` | `aud=http://localhost:5000` の AT |
+| ② | リフレッシュで `resource=API B` | `aud=http://localhost:5001` の AT |
+| ③ | API A を A 用トークンで呼ぶ | 200 |
+| ④ | API B を A 用トークンで呼ぶ | **401** (audience 不一致) |
+| ⑤ | API B を B 用トークンで呼ぶ | 200 |
+| ⑥ | 同意していない `resource=http://localhost:5002` を要求 | **400 invalid_target** |
+
+ポイント:
+
+- OP は `resource` を絶対 URI・フラグメント無し・既知の API (`RESOURCES` 環境変数) で検証し、だめなら `invalid_target`
+- トークンリクエストの `resource` は、認可時に同意した範囲の部分集合のみ許可
+- アクセストークンは RFC 9068 形式の JWT (`typ: at+jwt`)。API は署名・`iss`・`exp` に加え **`aud` が自分か** を検証する
+- 1 つの API 用のトークンが漏れても他の API では使えない (トークンの使い回し防止)
+
+## 失敗パターン
+
+トップページの「失敗パターンを試す」から、OP がどう弾くかを確認できます。
+
+- メタデータに無い redirect_uri
+- ドキュメント内 client_id と URL の不一致
+- ドキュメントが 404
+- パスの無い client_id URL
+- OP が知らない resource を要求 (`invalid_target` でクライアントに返る)
+
+http://localhost:3000 では OP がキャッシュしているメタデータを確認できます。
+
+## 注意 (デモ用の簡略化)
+
+- 仕様上 client_id URL は **https 必須** です。ローカルで試すため、OP は `ALLOW_HTTP_LOCALHOST_CLIENT_ID=true` のときだけ `http://localhost` を許可しています。
+- ブラウザと各プロセスから同じ `localhost:<port>` に届くよう、全プロセスを 1 コンテナで動かしています。
+- リフレッシュトークンはローテーションしますが、再利用検知などはしていません。
+- 本番では SSRF 対策 (内部 IP への取得禁止など)、`private_key_jwt` 対応、署名鍵の永続化なども必要です。
