@@ -12,6 +12,8 @@ const DEFAULT_CACHE_SEC = 300;
 const MAX_CACHE_SEC = 24 * 60 * 60;
 // RFC 8707: resource servers (APIs) this OP issues access tokens for.
 const KNOWN_RESOURCES = (process.env.RESOURCES || '').split(',').filter(Boolean);
+// "mcp:tools" is what the demo MCP servers (rs/server.js) require.
+const SUPPORTED_SCOPES = ['openid', 'profile', 'email', 'mcp:tools'];
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const kid = crypto.randomBytes(8).toString('hex');
@@ -224,7 +226,7 @@ const discovery = () => ({
   grant_types_supported: ['authorization_code', 'refresh_token'],
   subject_types_supported: ['public'],
   id_token_signing_alg_values_supported: ['RS256'],
-  scopes_supported: ['openid', 'profile', 'email'],
+  scopes_supported: SUPPORTED_SCOPES,
   token_endpoint_auth_methods_supported: ['none'],
   code_challenge_methods_supported: ['S256'],
   authorization_response_iss_parameter_supported: true,
@@ -262,8 +264,11 @@ async function handleAuthorize(res, params) {
   };
 
   if (params.get('response_type') !== 'code') return redirectError('unsupported_response_type', 'only "code" is supported');
+  // Plain OAuth (e.g. MCP clients asking only for "mcp:tools") is allowed; an ID token is issued only with "openid".
   const scope = params.get('scope') || '';
-  if (!scope.split(' ').includes('openid')) return redirectError('invalid_scope', 'scope must include "openid"');
+  const unknownScope = scope.split(' ').find((s) => s && !SUPPORTED_SCOPES.includes(s));
+  if (!scope.trim()) return redirectError('invalid_scope', 'scope is required');
+  if (unknownScope) return redirectError('invalid_scope', `unsupported scope "${unknownScope}"`);
   if (!params.get('code_challenge') || params.get('code_challenge_method') !== 'S256') {
     return redirectError('invalid_request', 'PKCE with S256 is required');
   }
@@ -395,7 +400,7 @@ async function handleToken(req, res) {
     scope: grant.scope,
     refresh_token: refreshToken,
   };
-  if (form.grant_type === 'authorization_code') {
+  if (form.grant_type === 'authorization_code' && scopes.includes('openid')) {
     body.id_token = signJwt({
       iss: ISSUER,
       sub: grant.user.sub,

@@ -22,7 +22,7 @@ const metadata = {
   grant_types: ['authorization_code'],
   response_types: ['code'],
   token_endpoint_auth_method: 'none',
-  scope: 'openid profile email',
+  scope: 'openid profile email mcp:tools',
 };
 
 // A document whose client_id does not match its own URL (the OP must reject it).
@@ -31,7 +31,7 @@ const mismatchedMetadata = { ...metadata, client_id: `${BASE}/someone-else.json`
 const LOGO = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="12" fill="#2b6cb0"/>
 <text x="32" y="41" font-size="24" text-anchor="middle" fill="#fff" font-family="sans-serif">CI</text></svg>`;
 
-const flows = new Map(); // state -> { verifier, nonce, clientId, redirectUri }
+const flows = new Map(); // state -> { verifier, nonce, clientId, redirectUri, mcp? }
 const NOT_AUTHORIZED_RESOURCE = 'http://localhost:5002';
 
 const b64url = (v) => Buffer.from(v).toString('base64url');
@@ -96,6 +96,15 @@ async function verifyIdToken(idToken, op, nonce) {
   return { header, payload };
 }
 
+async function requestToken(op, pairs) {
+  const r = await fetch(op.token_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams(pairs),
+  });
+  return { status: r.status, body: await r.json() };
+}
+
 // Builds an authorization request. Variants intentionally break things to show what the OP checks.
 async function handleLogin(res, variant) {
   const op = await discover();
@@ -113,25 +122,24 @@ async function handleLogin(res, variant) {
     resources = [API_A, API_B], // RFC 8707: ask for consent to both APIs up front
   } = variants[variant] || variants.normal;
 
-  const state = rand(16);
   const nonce = rand(16);
-  const verifier = rand(32);
-  flows.set(state, { verifier, nonce, clientId, redirectUri });
-
-  const u = new URL(op.authorization_endpoint);
-  const q = new URLSearchParams({
-    response_type: 'code',
-    client_id: clientId,
-    redirect_uri: redirectUri,
-    scope: 'openid profile email',
-    state,
-    nonce,
-    code_challenge: b64url(crypto.createHash('sha256').update(verifier).digest()),
-    code_challenge_method: 'S256',
-  });
+  const q = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, scope: 'openid profile email', nonce });
   for (const r of resources) q.append('resource', r);
-  u.search = q.toString();
-  log(`redirecting to OP (${variant || 'normal'}): ${u.href}`);
+  redirectToAuthorize(res, op, q, { nonce, clientId, redirectUri }, variant || 'normal');
+}
+
+// Adds state + PKCE to the authorization request, remembers the flow, and sends the browser to the OP.
+function redirectToAuthorize(res, op, query, flow, label) {
+  const state = rand(16);
+  const verifier = rand(32);
+  flows.set(state, { ...flow, verifier });
+  query.set('response_type', 'code');
+  query.set('state', state);
+  query.set('code_challenge', b64url(crypto.createHash('sha256').update(verifier).digest()));
+  query.set('code_challenge_method', 'S256');
+  const u = new URL(op.authorization_endpoint);
+  u.search = query.toString();
+  log(`redirecting to OP (${label}): ${u.href}`);
   send(res, 302, '', {
     location: u.href,
     // Cookies are not port-isolated, so use a name distinct from the OP's.
@@ -154,17 +162,12 @@ async function handleCallback(req, res, params) {
   }
   if (!flow || state !== cookieState) return html(res, `<div class="card err"><h1>state が不正です</h1><a href="/">戻る</a></div>`, 400);
 
-  const op = await discover();
+  // The MCP flow discovered its authorization server dynamically; the OIDC flow uses the configured ISSUER.
+  const op = flow.mcp?.as ?? (await discover());
   if (params.get('iss') !== op.issuer) return html(res, `<div class="card err"><h1>iss が一致しません</h1></div>`, 400);
+  if (flow.mcp) return handleMcpCallback(res, params, flow, op);
 
-  const tokenRequest = async (pairs) => {
-    const r = await fetch(op.token_endpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams(pairs),
-    });
-    return { status: r.status, body: await r.json() };
-  };
+  const tokenRequest = (pairs) => requestToken(op, pairs);
   const callApi = async (api, accessToken) => {
     try {
       const r = await fetch(`${api}/api/data`, { headers: { authorization: `Bearer ${accessToken}` } });
@@ -220,10 +223,8 @@ async function handleCallback(req, res, params) {
 
   log(`login succeeded: sub=${idToken.payload.sub}`);
 
-  const badge = (status, expected) =>
-    `<b style="color:${status === expected ? '#276749' : '#c53030'}">HTTP ${status}</b> (期待値 ${expected})`;
   const step = (title, desc, r, expected, extra = '') =>
-    `<div class="card"><h2>${title}</h2><p>${desc}</p><p>${badge(r.status, expected)}</p>${extra}<pre>${json(r.body)}</pre></div>`;
+    `<div class="card"><h2>${title}</h2><p>${desc}</p><p>${statusBadge(r.status, expected)}</p>${extra}<pre>${json(r.body)}</pre></div>`;
 
   html(
     res,
@@ -257,6 +258,197 @@ ${step(
   );
 }
 
+// --- MCP-style flow: start from nothing but the MCP server URL --------------
+// MCP authorization spec: 401 + WWW-Authenticate -> Protected Resource Metadata (RFC 9728)
+// -> Authorization Server Metadata (RFC 8414) -> authorize with CIMD + PKCE + resource (RFC 8707).
+const MCP_SERVERS = [`${API_A}/mcp`, `${API_B}/mcp`];
+const MCP_PROTOCOL_VERSION = '2025-06-18';
+const MCP_INITIALIZE = {
+  method: 'initialize',
+  params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: metadata.client_name, version: '0.1.0' } },
+};
+
+// Parses the auth-params of `Bearer k="v", k2="v2"`.
+function parseChallenge(header) {
+  const params = {};
+  for (const [, k, v] of (header || '').matchAll(/(\w+)="([^"]*)"/g)) params[k] = v;
+  return params;
+}
+
+async function getJson(url) {
+  const r = await fetch(url, { headers: { accept: 'application/json' }, redirect: 'error' });
+  return { status: r.status, body: r.ok ? await r.json() : null };
+}
+
+async function mcpPost(endpoint, accessToken, message) {
+  const r = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      'mcp-protocol-version': MCP_PROTOCOL_VERSION,
+      ...(accessToken && { authorization: `Bearer ${accessToken}` }),
+    },
+    body: JSON.stringify({ jsonrpc: '2.0', ...message }),
+  });
+  const text = await r.text();
+  return { status: r.status, wwwAuthenticate: r.headers.get('www-authenticate'), body: text ? JSON.parse(text) : null };
+}
+
+// The resource identifier must be the endpoint itself or a parent of it (same origin, path prefix).
+function resourceCovers(resource, endpoint) {
+  try {
+    const r = new URL(resource);
+    const e = new URL(endpoint);
+    const base = r.pathname.replace(/\/$/, '');
+    return r.origin === e.origin && (e.pathname === base || e.pathname.startsWith(`${base}/`));
+  } catch {
+    return false;
+  }
+}
+
+// RFC 8414 §3.1 inserts the well-known segment before the issuer's path; OIDC discovery appends it.
+function asMetadataUrls(issuer) {
+  const u = new URL(issuer);
+  const path = u.pathname.replace(/\/$/, '');
+  return [`${u.origin}/.well-known/oauth-authorization-server${path}`, `${u.origin}${path}/.well-known/openid-configuration`];
+}
+
+// Each step is recorded so the result page can show how the client found its way to the OP.
+async function discoverMcpAuthorization(endpoint) {
+  const trace = [];
+  const fail = (message) => Object.assign(new Error(message), { trace });
+
+  // 1) Call the MCP server without a token. It answers 401 and points at its resource metadata.
+  const r0 = await mcpPost(endpoint, null, { id: 0, ...MCP_INITIALIZE });
+  trace.push({ title: 'MCP サーバーにトークン無しでアクセス', req: `POST ${endpoint}`, status: r0.status, body: { 'www-authenticate': r0.wwwAuthenticate, body: r0.body } });
+  if (r0.status !== 401) throw fail(`expected 401 from the MCP server, got ${r0.status}`);
+  const challenge = parseChallenge(r0.wwwAuthenticate);
+
+  // 2) RFC 9728: Protected Resource Metadata (fall back to the well-known URI if not advertised).
+  const prmUrl = challenge.resource_metadata || `${new URL(endpoint).origin}/.well-known/oauth-protected-resource`;
+  const prm = await getJson(prmUrl);
+  trace.push({ title: 'Protected Resource Metadata を取得 (RFC 9728)', req: `GET ${prmUrl}`, status: prm.status, body: prm.body });
+  if (prm.status !== 200) throw fail('could not fetch protected resource metadata');
+  const { resource, authorization_servers: authServers = [], scopes_supported: scopes = [] } = prm.body;
+  // Otherwise a malicious server could make us obtain (and send it) a token for some other resource.
+  if (!resourceCovers(resource, endpoint)) throw fail(`resource "${resource}" does not match the MCP server ${endpoint}`);
+  const issuer = authServers[0];
+  if (!issuer) throw fail('protected resource metadata has no authorization_servers');
+
+  // 3) RFC 8414 Authorization Server Metadata, then OpenID Connect discovery as a fallback.
+  let as;
+  for (const url of asMetadataUrls(issuer)) {
+    const r = await getJson(url);
+    trace.push({ title: '認可サーバーのメタデータを取得 (RFC 8414)', req: `GET ${url}`, status: r.status, body: r.body });
+    if (r.status === 200) {
+      as = r.body;
+      break;
+    }
+  }
+  if (!as) throw fail(`could not fetch authorization server metadata for ${issuer}`);
+  if (as.issuer !== issuer) throw fail(`issuer in metadata ("${as.issuer}") does not match "${issuer}"`);
+  if (!as.code_challenge_methods_supported?.includes('S256')) throw fail('authorization server does not support PKCE S256');
+  if (!as.client_id_metadata_document_supported) {
+    // A real MCP client would fall back to Dynamic Client Registration or a pre-registered client_id here.
+    throw fail('authorization server does not support Client ID Metadata Documents');
+  }
+
+  // Prefer the scope from the challenge, then everything the resource says it supports.
+  const scope = challenge.scope || scopes.join(' ');
+  return { trace, resource, as, scope };
+}
+
+async function handleMcpLogin(res, endpoint) {
+  // Only known servers: this client should not be a proxy that fetches arbitrary URLs.
+  if (!MCP_SERVERS.includes(endpoint)) {
+    return html(res, `<div class="card err"><h1>不明な MCP サーバーです</h1><a href="/">戻る</a></div>`, 400);
+  }
+  let d;
+  try {
+    d = await discoverMcpAuthorization(endpoint);
+  } catch (e) {
+    if (!e.trace) throw e;
+    log(`MCP discovery failed: ${e.message}`);
+    return html(res, `<div class="card err"><h1>認可サーバーの発見に失敗</h1><p>${esc(e.message)}</p></div>${traceCards(e.trace)}`, 400);
+  }
+  log(`MCP discovery: ${endpoint} -> resource=${d.resource}, as=${d.as.issuer}, scope="${d.scope}"`);
+  // Same CIMD client_id as the OIDC flow: the OP has never seen this client, and does not need to.
+  const q = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, scope: d.scope, resource: d.resource });
+  redirectToAuthorize(res, d.as, q, { clientId: CLIENT_ID, redirectUri: REDIRECT_URI, mcp: { endpoint, ...d } }, 'mcp');
+}
+
+const traceCards = (trace, start = 1) =>
+  trace
+    .map(
+      (t, i) => `<div class="card"><h2>${start + i}. ${esc(t.title)}</h2><p><code>${esc(t.req)}</code>
+${t.expected === undefined ? `<b>HTTP ${esc(t.status)}</b>` : statusBadge(t.status, t.expected)}</p>
+${t.note ? `<p>${t.note}</p>` : ''}<pre>${json(t.body)}</pre></div>`,
+    )
+    .join('');
+
+const statusBadge = (status, expected) =>
+  `<b style="color:${status === expected ? '#276749' : '#c53030'}">HTTP ${esc(status)}</b> (期待値 ${esc(expected)})`;
+
+async function handleMcpCallback(res, params, flow, as) {
+  const { endpoint, resource, trace } = flow.mcp;
+
+  // 4) Code exchange, again with resource so the token is bound to this MCP server only.
+  const t = await requestToken(as, [
+    ['grant_type', 'authorization_code'],
+    ['code', params.get('code')],
+    ['redirect_uri', flow.redirectUri],
+    ['client_id', flow.clientId],
+    ['code_verifier', flow.verifier],
+    ['resource', resource],
+  ]);
+  const at = t.body.access_token;
+  const steps = [
+    {
+      title: 'トークンリクエスト (CIMD client_id + PKCE + resource)',
+      req: `POST ${as.token_endpoint}  resource=${resource}`,
+      status: t.status,
+      expected: 200,
+      note: 'scope に <code>openid</code> が無いので ID トークンは発行されない (MCP は OIDC ではなく OAuth)',
+      body: at ? { access_token_claims: decodeJwt(at).payload, response: t.body } : t.body,
+    },
+  ];
+  if (!at) return html(res, `<div class="card err"><h1>トークンリクエスト失敗</h1></div>${traceCards([...trace, ...steps])}`, 400);
+
+  // 5) Talk MCP with the token.
+  const init = await mcpPost(endpoint, at, { id: 1, ...MCP_INITIALIZE });
+  await mcpPost(endpoint, at, { method: 'notifications/initialized' });
+  const list = await mcpPost(endpoint, at, { id: 2, method: 'tools/list' });
+  const call = await mcpPost(endpoint, at, { id: 3, method: 'tools/call', params: { name: 'whoami', arguments: {} } });
+  steps.push(
+    { title: 'MCP initialize', req: `POST ${endpoint}`, status: init.status, expected: 200, body: init.body },
+    { title: 'MCP tools/list', req: `POST ${endpoint}`, status: list.status, expected: 200, body: list.body },
+    { title: 'MCP tools/call whoami', req: `POST ${endpoint}`, status: call.status, expected: 200, body: call.body },
+  );
+
+  // 6) The same token must not work at the other MCP server (audience mismatch).
+  const other = MCP_SERVERS.find((s) => s !== endpoint);
+  const cross = await mcpPost(other, at, { id: 1, ...MCP_INITIALIZE });
+  steps.push({
+    title: '同じトークンを別の MCP サーバーに送る',
+    req: `POST ${other}`,
+    status: cross.status,
+    expected: 401,
+    note: 'トークンの <code>aud</code> は最初の MCP サーバーだけなので拒否される (トークンのパススルー防止)',
+    body: { 'www-authenticate': cross.wwwAuthenticate, body: cross.body },
+  });
+
+  log(`MCP flow succeeded for ${endpoint}`);
+  html(
+    res,
+    `<div class="card"><h1 class="ok">MCP サーバーに接続しました: ${esc(endpoint)}</h1>
+<p>クライアントが最初に知っていたのは MCP サーバーの URL だけです。認可サーバー・resource・scope は
+<code>WWW-Authenticate</code> → RFC 9728 → RFC 8414 の順にたどって発見し、OP への事前登録もしていません (CIMD)。</p></div>
+${traceCards([...trace, ...steps])}
+<a class="btn" href="/">トップへ</a>`,
+  );
+}
+
 function handleIndex(res) {
   html(
     res,
@@ -266,6 +458,10 @@ client_id = <code><a href="/client-metadata.json">${esc(CLIENT_ID)}</a></code></
 <p><a class="btn" href="/login">OP でログイン</a></p>
 <p>ログイン後、Resource Indicators (RFC 8707) で API ごとに <code>aud</code> を絞ったアクセストークンを取得し、
 <code>${esc(API_A)}</code> / <code>${esc(API_B)}</code> を呼び分けます。</p></div>
+<div class="card"><h1>MCP 風フロー (RFC 9728 + CIMD)</h1>
+<p>MCP サーバーの URL だけを手がかりに、認可サーバーを自動で発見して接続します。</p><ul>
+${MCP_SERVERS.map((s) => `<li><a href="/mcp-login?server=${encodeURIComponent(s)}">${esc(s)} に接続</a></li>`).join('')}
+</ul></div>
 <div class="card"><h1>Client ID Metadata Document</h1><pre>${json(metadata)}</pre></div>
 <div class="card"><h1>失敗パターンを試す</h1><ul>
 <li><a href="/login?variant=unregistered-redirect">メタデータに無い redirect_uri を使う</a></li>
@@ -298,6 +494,8 @@ const server = http.createServer(async (req, res) => {
         return send(res, 200, LOGO, { 'content-type': 'image/svg+xml' });
       case 'GET /login':
         return await handleLogin(res, url.searchParams.get('variant'));
+      case 'GET /mcp-login':
+        return await handleMcpLogin(res, url.searchParams.get('server'));
       case 'GET /callback':
         return await handleCallback(req, res, url.searchParams);
       default:

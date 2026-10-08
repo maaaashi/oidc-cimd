@@ -3,6 +3,7 @@
 [OAuth Client ID Metadata Document](https://datatracker.ietf.org/doc/draft-ietf-oauth-client-id-metadata-document/) を手元で試すための最小構成です。
 **client_id が「クライアントのメタデータ JSON の URL」になり、OP への事前登録が不要になる** 仕組みを体験できます。
 さらに [Resource Indicators (RFC 8707)](https://www.rfc-editor.org/rfc/rfc8707) で、**アクセストークンの `aud` を API ごとに絞る** 動きも確認できます。
+[Protected Resource Metadata (RFC 9728)](https://www.rfc-editor.org/rfc/rfc9728) と組み合わせた **MCP の認可フロー** も試せます。
 
 ## 起動
 
@@ -23,7 +24,7 @@ docker compose logs -f   # OP がメタデータを取得する様子が見え�
 |---|---|---|
 | client | http://localhost:4000 | RP。`/client-metadata.json` で自分のメタデータを公開 |
 | op | http://localhost:3000 | CIMD / RFC 8707 対応の OpenID Provider (自作・依存なし) |
-| api-a | http://localhost:5000 | リソースサーバー。`aud` に `http://localhost:5000` を含むトークンだけ受け付ける |
+| api-a | http://localhost:5000 | リソースサーバー兼 MCP サーバー (`/mcp`)。`aud` に `http://localhost:5000` を含むトークンだけ受け付ける |
 | api-b | http://localhost:5001 | 同上 (`http://localhost:5001`) |
 
 いずれも依存パッケージなしの Node.js で、`start.js` が 1 つのコンテナ内で 4 プロセスとして起動します。
@@ -73,6 +74,33 @@ OP は discovery で `client_id_metadata_document_supported: true` を公開し�
 - アクセストークンは RFC 9068 形式の JWT (`typ: at+jwt`)。API は署名・`iss`・`exp` に加え **`aud` が自分か** を検証する
 - 1 つの API 用のトークンが漏れても他の API では使えない (トークンの使い回し防止)
 
+## MCP 風フロー (RFC 9728 + RFC 8414 + CIMD)
+
+トップページの「MCP 風フロー」から、[MCP の認可仕様](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) と同じ手順を試せます。
+クライアントは **MCP サーバーの URL (`http://localhost:5000/mcp`) しか知らない** 状態から始まります。
+
+```
+Client ──(1) POST /mcp (トークン無し)──▶ MCP サーバー
+       ◀── 401 WWW-Authenticate: Bearer resource_metadata="http://localhost:5000/.well-known/oauth-protected-resource", scope="mcp:tools"
+Client ──(2) GET /.well-known/oauth-protected-resource──▶ MCP サーバー      (RFC 9728)
+       ◀── { resource: "http://localhost:5000", authorization_servers: ["http://localhost:3000"], scopes_supported: ["mcp:tools"] }
+Client ──(3) GET /.well-known/oauth-authorization-server──▶ OP             (RFC 8414)
+       ◀── { ..., client_id_metadata_document_supported: true }
+Client ──(4) /authorize?client_id=<メタデータURL>&resource=http://localhost:5000&scope=mcp:tools  (CIMD + PKCE + RFC 8707)
+Client ──(5) /token resource=http://localhost:5000 → AT(aud=5000, scope=mcp:tools)
+Client ──(6) POST /mcp initialize / tools/list / tools/call (Bearer AT) → 200
+Client ──(7) 同じ AT で http://localhost:5001/mcp → 401 (audience 不一致)
+```
+
+ポイント:
+
+- 認可サーバー・`resource`・`scope` はすべて **401 レスポンスから芋づる式に発見** する。事前に設定するのは MCP サーバーの URL だけ
+- OP への事前登録も不要 (CIMD)。MCP クライアントは「どの認可サーバーに当たるか事前に分からない」ので、CIMD と特に相性がよい
+- クライアントは PRM の `resource` が接続先 MCP サーバーを指しているか、AS メタデータの `issuer` が PRM の値と一致するかを検証する
+- MCP は OIDC ではなく OAuth なので `scope=mcp:tools` だけを要求し、ID トークンは発行されない
+- `mcp:tools` を持たないトークン (OIDC フローで取ったもの) で `/mcp` を呼ぶと `403 insufficient_scope`
+- 別の MCP サーバー用のトークンは `aud` で拒否される (MCP 仕様が禁止している「トークンのパススルー」を防ぐ)
+
 ## 失敗パターン
 
 トップページの「失敗パターンを試す」から、OP がどう弾くかを確認できます。
@@ -90,4 +118,5 @@ http://localhost:3000 では OP がキャッシュしているメタデータを
 - 仕様上 client_id URL は **https 必須** です。ローカルで試すため、OP は `ALLOW_HTTP_LOCALHOST_CLIENT_ID=true` のときだけ `http://localhost` を許可しています。
 - ブラウザと各プロセスから同じ `localhost:<port>` に届くよう、全プロセスを 1 コンテナで動かしています。
 - リフレッシュトークンはローテーションしますが、再利用検知などはしていません。
+- MCP サーバーは JSON-RPC を JSON で返すだけの最小実装です (SSE・セッション管理なし)。PRM の `resource` は MCP エンドポイントの親 (`http://localhost:5000`) にしており、クライアントはパスの前方一致で検証しています。
 - 本番では SSRF 対策 (内部 IP への取得禁止など)、`private_key_jwt` 対応、署名鍵の永続化なども必要です。
