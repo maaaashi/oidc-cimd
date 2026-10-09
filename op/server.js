@@ -33,6 +33,16 @@ const rand = (n = 32) => crypto.randomBytes(n).toString('base64url');
 const esc = (s) =>
   String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 const log = (...a) => console.log(`[op] ${new Date().toISOString()}`, ...a);
+// Collapsible explanation for OIDC/OAuth beginners. `body` is trusted HTML.
+const hint = (title, body, open = false) =>
+  `<details class="hint"${open ? ' open' : ''}><summary>💡 ${title}</summary>${body}</details>`;
+
+const SCOPE_DESCRIPTIONS = {
+  openid: 'OIDC でログインする (ID トークンを発行する)',
+  profile: '名前などのプロフィール',
+  email: 'メールアドレス',
+  'mcp:tools': 'MCP サーバーのツールを使う',
+};
 
 function signJwt(payload, typ = 'JWT') {
   const header = { alg: 'RS256', typ, kid };
@@ -174,6 +184,8 @@ function page(title, body) {
  .client{display:flex;gap:16px;align-items:center} .client img{width:56px;height:56px}
  .err{background:#fee;border-color:#e99} button{padding:8px 20px;font-size:15px;margin-right:8px;cursor:pointer}
  input{padding:6px;margin:4px 0 10px;width:200px} table{border-collapse:collapse} td{padding:4px 8px;border-bottom:1px solid #eee;vertical-align:top}
+ .hint{background:#fffbea;border:1px solid #f0d98a;border-radius:8px;padding:8px 14px;margin:12px 0;font-size:14px;line-height:1.7}
+ .hint summary{cursor:pointer;font-weight:bold;color:#8a6d00} .hint dt{font-weight:bold;margin-top:6px} .hint dd{margin:0 0 0 1.5em}
 </style></head><body><p class="op">Demo OP (${esc(ISSUER)})</p>${body}</body></html>`;
 }
 
@@ -182,7 +194,14 @@ const errorPage = (res, message) =>
     res,
     400,
     page('Error', `<div class="card err"><h1>認可リクエストを処理できません</h1><p>${esc(message)}</p>
-<p>redirect_uri を検証できていないため、クライアントへはリダイレクトしません。</p></div>`),
+<p>redirect_uri を検証できていないため、クライアントへはリダイレクトしません。</p>
+${hint(
+  'なぜクライアントに戻さないの?',
+  `<p>通常、認可リクエストのエラーは <code>redirect_uri</code> に <code>error=...</code> を付けてクライアントに返します。
+しかし client_id や redirect_uri が正しいと確認できていない段階では、その redirect_uri が攻撃者のサイトかもしれません。
+そのため OP は自分の画面でエラーを表示して止まります (open redirector 対策)。</p>`,
+  true,
+)}</div>`),
     { 'content-type': 'text/html; charset=utf-8' },
   );
 
@@ -198,7 +217,10 @@ function consentPage(id, req, error) {
     <div><h1>${esc(c.client_name || '(no client_name)')} がアクセスを求めています</h1>
     <div>このアプリのドメイン: <b>${esc(host)}</b>${c.client_uri ? ` ・ <a href="${esc(c.client_uri)}">${esc(c.client_uri)}</a>` : ''}</div></div>
   </div>
-  <p>要求スコープ: ${req.scope.split(' ').map((s) => `<code>${esc(s)}</code>`).join(' ')}</p>
+  <p>要求スコープ:</p><ul>${req.scope
+    .split(' ')
+    .map((s) => `<li><code>${esc(s)}</code> ${esc(SCOPE_DESCRIPTIONS[s] ?? '')}</li>`)
+    .join('')}</ul>
   <p>アクセス先 API (resource): ${
     req.resources.length ? req.resources.map((r) => `<code>${esc(r)}</code>`).join(' ') : '(指定なし)'
   }</p>
@@ -209,10 +231,34 @@ function consentPage(id, req, error) {
     <div>パスワード<br><input name="password" type="password" value="password"></div>
     <button name="action" value="approve">許可</button><button name="action" value="deny">拒否</button>
   </form>
+  ${hint(
+    'この画面は何? (同意画面)',
+    `<p>ここは OP (ログインを担当するサーバー) の画面です。パスワードを入力するのはアプリではなく OP なので、
+アプリ側にパスワードが渡ることはありません。</p>
+<p>ログインと同時に「このアプリに、これらの情報・権限を渡してよいか」の <b>同意</b> を求めています。</p>
+<dl>
+<dt>要求スコープ</dt><dd>アプリが欲しがっている情報や権限です。</dd>
+<dt>アクセス先 API (resource)</dt><dd>発行するアクセストークンを使える API です。ここに無い API 用のトークンは後から要求しても発行されません。</dd>
+<dt>戻り先</dt><dd>許可後にブラウザが戻る URL です。メタデータの <code>redirect_uris</code> と完全一致したものだけが使えます。</dd>
+</dl>
+<p><b>注意:</b> アプリ名やロゴはアプリ自身が書いた自己申告なので、誰でも好きに名乗れます。
+信頼できるのは「ドメイン (<code>${esc(host)}</code>)」の方です。CIMD 対応の OP では、ドメインを目立たせて表示することが推奨されています。</p>`,
+  )}
 </div>
 <div class="card"><h1>OP が取得した Client ID Metadata Document</h1>
 <p>client_id: <code>${esc(req.clientId)}</code></p><pre>${esc(JSON.stringify(c, null, 2))}</pre>
-<p>事前のクライアント登録なしに、この URL から取得した情報だけで同意画面を表示しています。</p></div>`,
+<p>事前のクライアント登録なしに、この URL から取得した情報だけで同意画面を表示しています。</p>
+${hint(
+  'OP がこのドキュメントについて確認したこと',
+  `<ul>
+<li>client_id の URL の形式 (https であること、パスがあること など。このデモでは http://localhost も許可)</li>
+<li>リダイレクトせずに取得でき、サイズが 5KB 以下の JSON であること</li>
+<li>中の <code>client_id</code> が取得元 URL と完全に一致すること (なりすまし防止)</li>
+<li><code>client_secret</code> を含まないこと (公開ドキュメントに秘密は置けない)</li>
+<li>リクエストの <code>redirect_uri</code> が <code>redirect_uris</code> に含まれること</li>
+</ul>
+<p>取得したドキュメントは <code>Cache-Control</code> に従って一定時間キャッシュされ、毎回取りに行くことはしません。</p>`,
+)}</div>`,
   );
 }
 
@@ -430,8 +476,18 @@ function handleIndex(res) {
       'Demo OP',
       `<div class="card"><h1>CIMD 対応 デモ OP</h1>
 <p><a href="/.well-known/openid-configuration">/.well-known/openid-configuration</a> の
-<code>client_id_metadata_document_supported: true</code> がサポートの目印です。</p></div>
+<code>client_id_metadata_document_supported: true</code> がサポートの目印です。</p>
+${hint(
+  'OP とは? discovery とは?',
+  `<p>OP (OpenID Provider) は、ユーザーのログインを担当し、ID トークンやアクセストークンを発行するサーバーです。</p>
+<p><code>/.well-known/openid-configuration</code> (discovery) は OP の自己紹介 JSON です。
+クライアントはここを読むだけで、ログイン画面 (<code>authorization_endpoint</code>)・トークン発行 (<code>token_endpoint</code>)・
+署名検証用の公開鍵 (<code>jwks_uri</code>) などの URL や、対応している機能を知ることができます。</p>`,
+  true,
+)}</div>
 <div class="card"><h1>キャッシュ中の Client ID Metadata Document</h1>
+<p>OP は client_id の URL から取得したドキュメントを、<code>Cache-Control: max-age</code> の間だけ覚えておきます。
+ログインを試した後にこのページを再読み込みすると、ここに表示されます。</p>
 ${rows ? `<table><tr><td>client_id</td><td>client_name</td><td>取得時刻</td><td>残りTTL</td></tr>${rows}</table>` : '<p>まだありません</p>'}
 </div>`,
     ),
