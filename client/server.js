@@ -101,13 +101,39 @@ async function verifyIdToken(idToken, op, nonce) {
   return { header, payload };
 }
 
-async function requestToken(op, pairs) {
+// RFC 9449 DPoP: this client's key pair. Tokens requested with a proof from this key are bound to it (cnf.jkt),
+// so they are useless to anyone who does not hold the private key. A real client would keep one per installation
+// or session, ideally in non-exportable storage.
+const dpopKey = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+// An attacker's own key pair, to show what happens when someone steals the tokens but not the private key.
+const attackerKey = crypto.generateKeyPairSync('ec', { namedCurve: 'P-256' });
+
+// A DPoP proof is a short-lived JWT, signed by the client's key, that is valid for one HTTP request only.
+function createDpopProof(key, htm, htu, accessToken) {
+  const { kty, crv, x, y } = key.publicKey.export({ format: 'jwk' });
+  const header = { typ: 'dpop+jwt', alg: 'ES256', jwk: { kty, crv, x, y } };
+  const payload = {
+    jti: rand(16),
+    htm,
+    htu,
+    iat: Math.floor(Date.now() / 1000),
+    // At a resource server, the proof also carries the hash of the access token it is sent with.
+    ...(accessToken && { ath: b64url(crypto.createHash('sha256').update(accessToken).digest()) }),
+  };
+  const input = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`;
+  const sig = crypto.sign('sha256', Buffer.from(input), { key: key.privateKey, dsaEncoding: 'ieee-p1363' });
+  return `${input}.${b64url(sig)}`;
+}
+
+// With `key`, a DPoP proof is sent so that the issued tokens are bound to that key.
+async function requestToken(op, pairs, key) {
+  const proof = key && createDpopProof(key, 'POST', op.token_endpoint);
   const r = await fetch(op.token_endpoint, {
     method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    headers: { 'content-type': 'application/x-www-form-urlencoded', ...(proof && { dpop: proof }) },
     body: new URLSearchParams(pairs),
   });
-  return { status: r.status, body: await r.json() };
+  return { status: r.status, body: await r.json(), proof };
 }
 
 // Builds an authorization request. Variants intentionally break things to show what the OP checks.
@@ -190,16 +216,25 @@ ${hint(
   if (params.get('iss') !== op.issuer) return html(res, `<div class="card err"><h1>iss が一致しません</h1></div>`, 400);
   if (flow.mcp) return handleMcpCallback(res, params, flow, op);
 
-  const tokenRequest = (pairs) => requestToken(op, pairs);
-  const callApi = async (api, accessToken) => {
+  // This flow uses DPoP throughout: every token request and API call carries a proof from dpopKey.
+  const tokenRequest = (pairs, key = dpopKey) => requestToken(op, pairs, key);
+  // Options let the attack steps send the token as Bearer, sign with another key, or replay an old proof.
+  const callApi = async (api, accessToken, { scheme = 'DPoP', key = dpopKey, proof } = {}) => {
+    const url = `${api}/api/data`;
+    proof ??= key && createDpopProof(key, 'GET', url, accessToken);
     try {
-      const r = await fetch(`${api}/api/data`, { headers: { authorization: `Bearer ${accessToken}` } });
-      return { status: r.status, body: await r.json() };
+      const r = await fetch(url, { headers: { authorization: `${scheme} ${accessToken}`, ...(proof && { dpop: proof }) } });
+      const body = await r.json();
+      return { status: r.status, body: r.ok ? body : { 'www-authenticate': r.headers.get('www-authenticate'), body }, proof };
     } catch (e) {
       return { status: 'error', body: { error: `cannot reach ${api}: ${e.cause?.code || e.message}` } };
     }
   };
   const atClaims = (t) => (t.body.access_token ? decodeJwt(t.body.access_token).payload : undefined);
+  const proofClaims = (proof) => {
+    const { header, payload } = decodeJwt(proof);
+    return { header, payload };
+  };
 
   // 1) Code exchange. Public client: no secret, just the metadata URL + PKCE.
   //    resource narrows the access token to API A only.
@@ -236,7 +271,22 @@ ${hint(
   const callBwithA = await callApi(API_B, tokenA);
   const callBwithB = tokenB ? await callApi(API_B, tokenB) : { status: '-', body: 'no token' };
 
-  // 4) Asking for a resource that was never authorized fails with invalid_target.
+  // 4) DPoP: suppose an attacker has stolen the access token / refresh token (but not dpopKey's private key).
+  const stolenAsBearer = await callApi(API_A, tokenA, { scheme: 'Bearer', key: null });
+  const stolenWithOwnKey = await callApi(API_A, tokenA, { key: attackerKey });
+  const replayedProof = await callApi(API_A, tokenA, { proof: callAwithA.proof });
+  // Uses t2's refresh token before step 5 does; the OP checks the key binding before rotating it.
+  const stolenRefresh = await tokenRequest(
+    [
+      ['grant_type', 'refresh_token'],
+      ['refresh_token', t2.body.refresh_token ?? ''],
+      ['client_id', flow.clientId],
+      ['resource', API_A],
+    ],
+    attackerKey,
+  );
+
+  // 5) Asking for a resource that was never authorized fails with invalid_target.
   const t3 = await tokenRequest([
     ['grant_type', 'refresh_token'],
     ['refresh_token', t2.body.refresh_token ?? ''],
@@ -282,12 +332,17 @@ ${step(
   `<code>resource=${esc(API_A)}</code> を付けてトークンを要求`,
   t1,
   200,
-  `<p>アクセストークンの中身:</p><pre>${json(atClaims(t1))}</pre><p>レスポンス全体:</p>`,
+  `<p>送った DPoP proof (<code>DPoP</code> ヘッダー) の中身:</p><pre>${json(proofClaims(t1.proof))}</pre>
+<p>アクセストークンの中身 (<code>cnf.jkt</code> に注目):</p><pre>${json(atClaims(t1))}</pre><p>レスポンス全体:</p>`,
   `<p>認可コード・PKCE の <code>code_verifier</code>・client_id を OP の <code>/token</code> に送ってトークンと交換します。
 このアプリは公開クライアントなのでクライアントシークレットは送りません。</p>
 <p><code>resource</code> (RFC 8707 Resource Indicators) は「このトークンをどの API で使うか」の指定です。
 するとアクセストークンの <code>aud</code> がその API になります。入館証に「A 棟専用」と書いてもらうイメージです。</p>
-<p>レスポンスには <code>access_token</code> (API 用)・<code>id_token</code> (ログイン証明)・<code>refresh_token</code> (トークン再発行用) が含まれます。</p>`,
+<p>レスポンスには <code>access_token</code> (API 用)・<code>id_token</code> (ログイン証明)・<code>refresh_token</code> (トークン再発行用) が含まれます。</p>
+<p>このリクエストには <b>DPoP proof</b> も付けています (RFC 9449)。クライアントが自分で作った鍵ペアの秘密鍵で署名した小さな JWT で、
+ヘッダーに公開鍵 (<code>jwk</code>) が入っています。OP は署名を確かめ、その公開鍵のハッシュ (thumbprint) を
+アクセストークンの <code>cnf.jkt</code> に書き込みます。<code>token_type</code> も <code>Bearer</code> ではなく <code>DPoP</code> になります。
+入館証に「この鍵を持っている人専用」と書いてもらうイメージです。</p>`,
 )}
 ${step(
   '② リフレッシュトークン → トークン (resource=API B)',
@@ -298,16 +353,25 @@ ${step(
   `<p>アクセストークンは盗まれたときの被害を小さくするため短命 (このデモでは 5 分) です。
 <b>リフレッシュトークン</b> を使うと、ユーザーにもう一度ログインしてもらわずに新しいアクセストークンをもらえます。</p>
 <p>最初の認可リクエストで API A と API B の両方に同意済みなので、今度は API B 用のトークンを発行してもらえます。
-なお、リフレッシュトークンは使うたびに新しいものに入れ替わります (ローテーション)。</p>`,
+なお、リフレッシュトークンは使うたびに新しいものに入れ替わります (ローテーション)。</p>
+<p>リフレッシュトークンも ① の DPoP の鍵に紐付いているので、同じ鍵で作った proof を付けないと使えません (⑩ で確認)。</p>`,
 )}
 ${step(
   '③ API A を API A 用トークンで呼ぶ',
   `GET ${esc(API_A)}/api/data`,
   callAwithA,
   200,
-  '',
+  `<p>送った DPoP proof の中身:</p><pre>${json(proofClaims(callAwithA.proof))}</pre><p>レスポンス:</p>`,
   `<p>API はトークンを受け取ると、OP の公開鍵で署名を確かめ、発行者 (<code>iss</code>)・有効期限 (<code>exp</code>)・
-宛先 (<code>aud</code>) が自分であることを確認します。すべて OK なのでデータが返ります。</p>`,
+宛先 (<code>aud</code>) が自分であることを確認します。</p>
+<p>さらにトークンに <code>cnf.jkt</code> があるので、<code>Authorization: DPoP &lt;トークン&gt;</code> と一緒に送られた DPoP proof も検証します。</p>
+<dl>
+<dt>署名と jwk</dt><dd>proof の署名が、ヘッダーの公開鍵で正しく検証できること。その公開鍵の thumbprint がトークンの <code>cnf.jkt</code> と一致すること。</dd>
+<dt>htm / htu</dt><dd>この proof が「GET」「<code>${esc(API_A)}/api/data</code>」へのリクエスト専用に作られたこと。</dd>
+<dt>ath</dt><dd>このアクセストークンのハッシュ。別のトークン用に作った proof を流用できないようにします。</dd>
+<dt>iat / jti</dt><dd>作られたばかりであること、一度も使われていない ID であること。</dd>
+</dl>
+<p>すべて OK なのでデータが返ります。</p>`,
 )}
 ${step(
   '④ API B を API A 用トークンで呼ぶ',
@@ -328,6 +392,66 @@ ${step(
   '',
   `<p>リフレッシュトークンで発行できるのは、ユーザーが最初に同意した範囲 (API A / API B) のトークンだけです。
 同意していない API 向けのトークンをこっそり手に入れることはできません。</p>`,
+)}
+<div class="card"><h1>DPoP (RFC 9449): 盗まれたトークンを使わせない</h1>
+<p>ここからは、攻撃者がアクセストークンやリフレッシュトークンを盗んだ (でもクライアントの秘密鍵は持っていない) 場面を試します。</p>
+${hint(
+  'DPoP とは? aud による制限との違い',
+  `<p>普通のアクセストークンは <b>Bearer トークン</b> (持参人トークン) です。「持っている人なら誰でも使える」ので、
+ログや通信経路、悪意のある API などから漏れると、そのまま悪用されてしまいます。</p>
+<dl>
+<dt>aud (RFC 8707) で絞れるもの</dt><dd><b>どの API で</b> 使えるか。漏れても被害はその API だけになりますが、その API では使えてしまいます。</dd>
+<dt>DPoP で絞れるもの</dt><dd><b>誰が</b> 使えるか。トークンを特定の鍵に紐付け、その秘密鍵で署名した proof を毎回要求します。
+秘密鍵はクライアントの外に出ないので、トークンだけ盗んでも使えません。</dd>
+</dl>
+<p>クライアントシークレットを持てない公開クライアント (このアプリのような CIMD のクライアントやスマホアプリ) でも、
+その場で鍵ペアを作るだけで使えるのが特徴です。事前に鍵を OP へ登録する必要もありません。</p>
+<p>なお、このデモの MCP 風フローは Bearer のままです。MCP の認可仕様が <code>Authorization: Bearer</code> を前提としているためです。
+このクライアントが常に DPoP を使うなら、CIMD のメタデータに <code>"dpop_bound_access_tokens": true</code> と書けば、
+OP は DPoP 無しのトークンリクエストを拒否します。</p>`,
+)}</div>
+${step(
+  '⑦ 盗んだアクセストークンを Bearer として使う',
+  'DPoP に紐付いたトークンは <code>Authorization: Bearer</code> では受け付けられない',
+  stolenAsBearer,
+  401,
+  '',
+  `<p>攻撃者は proof を作れないので、トークンを普通の Bearer トークンとして送ってみます。
+API はトークンの <code>cnf.jkt</code> を見て「DPoP 専用のトークンだ」とわかるので、Bearer では拒否します。
+<code>WWW-Authenticate: DPoP ...</code> は「DPoP で来てください」という意味です。</p>`,
+)}
+${step(
+  '⑧ 盗んだアクセストークンに、攻撃者自身の鍵で作った proof を付ける',
+  '署名は正しくても、鍵がトークンに書かれた <code>cnf.jkt</code> と違うので拒否される',
+  stolenWithOwnKey,
+  401,
+  `<p>攻撃者の proof の公開鍵 (正規のクライアントの鍵とは別物):</p><pre>${json(stolenWithOwnKey.proof && proofClaims(stolenWithOwnKey.proof).header.jwk)}</pre><p>レスポンス:</p>`,
+  `<p>proof は誰でも作れます。自分で鍵ペアを作って署名すればよいだけです。
+しかしトークンには「正規のクライアントの公開鍵の thumbprint」が OP の署名付きで書き込まれています。
+攻撃者の鍵の thumbprint はそれと一致しないので、API は拒否します (<code>invalid_dpop_proof</code>)。</p>`,
+)}
+${step(
+  '⑨ ③ で送った proof をそのまま使い回す (リプレイ)',
+  'トークンと proof の両方を盗んでも、proof は 1 回しか使えない',
+  replayedProof,
+  401,
+  '',
+  `<p>通信を盗み見て、トークンと proof の組をまるごと手に入れた場合です。proof は正規の鍵で署名されていますが、
+<code>jti</code> (proof ごとの一意な ID) がすでに使われているので拒否されます。
+proof は <code>iat</code> から短時間 (このデモでは 60 秒) しか有効でなく、<code>htm</code>/<code>htu</code> で特定のリクエスト専用になっているので、
+別の API や別の操作にも流用できません。</p>`,
+)}
+${step(
+  '⑩ 盗んだリフレッシュトークンを、攻撃者の鍵で使う',
+  'リフレッシュトークンも鍵に紐付いているので、新しいトークンは発行されない',
+  stolenRefresh,
+  400,
+  '',
+  `<p>リフレッシュトークンはアクセストークンより長生きなので、盗まれたときの被害も大きくなります。
+シークレットを持たない公開クライアントの場合、OP は DPoP で発行したリフレッシュトークンを同じ鍵に紐付けます。
+攻撃者の鍵の proof では <code>invalid_grant</code> になります。</p>
+<p>このデモの OP は、鍵が違う場合はリフレッシュトークンを消費しない (ローテーションしない) ようにしています。
+攻撃者が正規のクライアントのリフレッシュトークンを使えなくする、という嫌がらせを防ぐためです。⑥ はこの後、同じリフレッシュトークンを正しい鍵で使っています。</p>`,
 )}
 <a class="btn" href="/">トップへ</a>`,
   );
@@ -608,7 +732,8 @@ OP は初めて見るアプリでも、その URL を取りに行けば名前・
 client_id = <code><a href="/client-metadata.json">${esc(CLIENT_ID)}</a></code></p>
 <p><a class="btn" href="/login">OP でログイン</a></p>
 <p>ログイン後、Resource Indicators (RFC 8707) で API ごとに <code>aud</code> を絞ったアクセストークンを取得し、
-<code>${esc(API_A)}</code> / <code>${esc(API_B)}</code> を呼び分けます。</p>
+<code>${esc(API_A)}</code> / <code>${esc(API_B)}</code> を呼び分けます。
+トークンは DPoP (RFC 9449) でこのアプリの鍵に紐付け、盗まれたトークンが使えないことも確認します。</p>
 ${hint(
   'ボタンを押すと何が起きる? (認可コードフロー)',
   `<ol>

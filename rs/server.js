@@ -4,6 +4,7 @@
 // No dependencies (Node.js 22+).
 const http = require('node:http');
 const crypto = require('node:crypto');
+const dpop = require('../lib/dpop.js');
 
 const PORT = Number(process.env.PORT || 5000);
 const RESOURCE = process.env.RESOURCE || `http://localhost:${PORT}`; // this API's resource identifier
@@ -43,10 +44,31 @@ async function verifyAccessToken(token) {
   return payload;
 }
 
+// RFC 9449 §7: a DPoP-bound token (cnf.jkt) is only usable with a fresh proof signed by that same key.
+// Errors carry the code and scheme for the WWW-Authenticate challenge.
+const dpopError = (error, message) => Object.assign(new Error(message), { error, scheme: 'DPoP' });
+function checkTokenBinding(req, scheme, token, at) {
+  const jkt = at.cnf?.jkt;
+  if (!jkt) {
+    if (scheme === 'DPoP') throw dpopError('invalid_token', 'access token is not DPoP-bound');
+    return;
+  }
+  // Otherwise anyone holding a copy of the token could use it as a plain bearer token.
+  if (scheme !== 'DPoP') throw dpopError('invalid_token', 'DPoP-bound access token must be sent with the DPoP scheme, not Bearer');
+  let proofJkt;
+  try {
+    const { pathname } = new URL(req.url, RESOURCE);
+    proofJkt = dpop.verifyDpopProof(req.headers.dpop, { htm: req.method, htu: `${RESOURCE}${pathname}`, accessToken: token });
+  } catch (e) {
+    throw dpopError('invalid_dpop_proof', e.message);
+  }
+  if (proofJkt !== jkt) throw dpopError('invalid_dpop_proof', 'DPoP proof is signed by a different key than the token is bound to');
+}
+
 // RFC 9728 §5.1: tell the client where to find this resource's metadata (and thus its authorization server).
-function challenge(params) {
-  const all = { ...params, resource_metadata: RESOURCE_METADATA_URL };
-  return `Bearer ${Object.entries(all)
+function challenge(params, scheme = 'Bearer') {
+  const all = { ...params, resource_metadata: RESOURCE_METADATA_URL, ...(scheme === 'DPoP' && { algs: dpop.SUPPORTED_ALGS.join(' ') }) };
+  return `${scheme} ${Object.entries(all)
     .map(([k, v]) => `${k}="${String(v).replace(/"/g, "'")}"`)
     .join(', ')}`;
 }
@@ -58,7 +80,7 @@ const sendJson = (res, status, obj, headers = {}) => {
 
 // Returns the verified token payload, or sends 401/403 and returns undefined.
 async function authorize(req, res, requiredScope) {
-  const m = /^Bearer (.+)$/.exec(req.headers.authorization || '');
+  const m = /^(Bearer|DPoP) (.+)$/.exec(req.headers.authorization || '');
   if (!m) {
     log('401 no token -> pointing client to protected resource metadata');
     // RFC 6750 §3.1: no error code when the request simply lacked credentials.
@@ -66,15 +88,18 @@ async function authorize(req, res, requiredScope) {
     return;
   }
   let at;
+  const [, scheme, token] = m;
   try {
-    at = await verifyAccessToken(m[1]);
+    at = await verifyAccessToken(token);
+    checkTokenBinding(req, scheme, token, at);
   } catch (e) {
-    log(`401 ${e.message}`);
+    const error = e.error || 'invalid_token';
+    log(`401 ${error}: ${e.message}`);
     sendJson(
       res,
       401,
-      { error: 'invalid_token', error_description: e.message },
-      { 'www-authenticate': challenge({ error: 'invalid_token', error_description: e.message }) },
+      { error, error_description: e.message },
+      { 'www-authenticate': challenge({ error, error_description: e.message }, e.scheme) },
     );
     return;
   }
@@ -145,6 +170,9 @@ http
               authorization_servers: [ISSUER],
               scopes_supported: [MCP_SCOPE],
               bearer_methods_supported: ['header'],
+              // RFC 9728 / RFC 9449: DPoP-bound tokens are accepted (and checked), but Bearer is still allowed.
+              dpop_signing_alg_values_supported: dpop.SUPPORTED_ALGS,
+              dpop_bound_access_tokens_required: false,
               resource_name: `${NAME} (demo MCP server)`,
             },
             { 'cache-control': 'max-age=60' },

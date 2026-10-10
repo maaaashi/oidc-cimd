@@ -4,6 +4,7 @@
 **client_id が「クライアントのメタデータ JSON の URL」になり、OP への事前登録が不要になる** 仕組みを体験できます。
 さらに [Resource Indicators (RFC 8707)](https://www.rfc-editor.org/rfc/rfc8707) で、**アクセストークンの `aud` を API ごとに絞る** 動きも確認できます。
 [Protected Resource Metadata (RFC 9728)](https://www.rfc-editor.org/rfc/rfc9728) と組み合わせた **MCP の認可フロー** も試せます。
+[DPoP (RFC 9449)](https://www.rfc-editor.org/rfc/rfc9449) で、**トークンをクライアントの鍵に紐付け、盗まれても使えなくする** 動きも確認できます。
 
 ## 起動
 
@@ -14,7 +15,7 @@ docker compose logs -f   # OP がメタデータを取得する様子が見え�
 
 1. http://localhost:4000 を開く (クライアント / RP)
 2. 「OP でログイン」 → OP の同意画面 (alice / password が入力済み)
-3. 「許可」 → ID トークンと、API 呼び分けの結果 (①〜⑥) が表示される
+3. 「許可」 → ID トークンと、API 呼び分けの結果 (①〜⑥)、DPoP の攻撃パターン (⑦〜⑩) が表示される
 
 停止: `docker compose down`
 
@@ -28,6 +29,7 @@ docker compose logs -f   # OP がメタデータを取得する様子が見え�
 | api-b | http://localhost:5001 | 同上 (`http://localhost:5001`) |
 
 いずれも依存パッケージなしの Node.js で、`start.js` が 1 つのコンテナ内で 4 プロセスとして起動します。
+DPoP proof の検証は OP と API で共通なので `lib/dpop.js` にまとめています。
 
 ## 流れ
 
@@ -74,6 +76,34 @@ OP は discovery で `client_id_metadata_document_supported: true` を公開し�
 - アクセストークンは RFC 9068 形式の JWT (`typ: at+jwt`)。API は署名・`iss`・`exp` に加え **`aud` が自分か** を検証する
 - 1 つの API 用のトークンが漏れても他の API では使えない (トークンの使い回し防止)
 
+## DPoP (RFC 9449)
+
+OIDC フローのトークンリクエストと API 呼び出しには、すべて DPoP proof を付けています。
+
+```
+Client: 起動時に ES256 の鍵ペアを生成 (OP への登録は不要)
+Client ──/token  DPoP: <proof(htm=POST, htu=/token, jwk=公開鍵)>──▶ OP
+       ◀── token_type: DPoP, AT に cnf.jkt (= 公開鍵の thumbprint)。リフレッシュトークンも同じ鍵に紐付け
+Client ──GET /api/data  Authorization: DPoP <AT>
+                        DPoP: <proof(htm=GET, htu=/api/data, ath=hash(AT))>──▶ API
+API: proof の署名 → thumbprint が cnf.jkt と一致? → htm/htu/ath/iat → jti 未使用? → 200
+```
+
+| # | 攻撃 | 結果 |
+|---|---|---|
+| ⑦ | 盗んだ AT を `Authorization: Bearer` で送る | **401** (DPoP に紐付いたトークンは Bearer では使えない) |
+| ⑧ | 盗んだ AT に攻撃者自身の鍵の proof を付ける | **401 invalid_dpop_proof** (鍵が `cnf.jkt` と不一致) |
+| ⑨ | ③ の proof をそのまま再送 | **401 invalid_dpop_proof** (`jti` の再利用) |
+| ⑩ | 盗んだリフレッシュトークンを攻撃者の鍵で使う | **400 invalid_grant** |
+
+ポイント:
+
+- `aud` (RFC 8707) は「**どの API で**」使えるかを絞り、DPoP は「**誰が**」使えるかを絞る。両方で漏えい時の被害を小さくできる
+- シークレットを持てない公開クライアント (CIMD のクライアントなど) でも、その場で作った鍵だけで使える
+- OP は discovery に `dpop_signing_alg_values_supported`、API は PRM に `dpop_bound_access_tokens_required: false` を公開
+- CIMD のメタデータに `"dpop_bound_access_tokens": true` を書くと、OP はそのクライアントの DPoP 無しトークンリクエストを拒否する (このデモのクライアントは MCP フローで Bearer を使うので書いていない)
+- MCP 風フローは Bearer のまま (MCP の認可仕様が `Authorization: Bearer` を前提としているため)
+
 ## MCP 風フロー (RFC 9728 + RFC 8414 + CIMD)
 
 トップページの「MCP 風フロー」から、[MCP の認可仕様](https://modelcontextprotocol.io/specification/2025-06-18/basic/authorization) と同じ手順を試せます。
@@ -118,5 +148,6 @@ http://localhost:3000 では OP がキャッシュしているメタデータを
 - 仕様上 client_id URL は **https 必須** です。ローカルで試すため、OP は `ALLOW_HTTP_LOCALHOST_CLIENT_ID=true` のときだけ `http://localhost` を許可しています。
 - ブラウザと各プロセスから同じ `localhost:<port>` に届くよう、全プロセスを 1 コンテナで動かしています。
 - リフレッシュトークンはローテーションしますが、再利用検知などはしていません。
+- DPoP の `DPoP-Nonce` (サーバー提供の nonce) と、認可リクエストの `dpop_jkt` (認可コードの鍵への紐付け) は実装していません。使用済み `jti` はプロセスごとのメモリに保持しています。
 - MCP サーバーは JSON-RPC を JSON で返すだけの最小実装です (SSE・セッション管理なし)。PRM の `resource` は MCP エンドポイントの親 (`http://localhost:5000`) にしており、クライアントはパスの前方一致で検証しています。
 - 本番では SSRF 対策 (内部 IP への取得禁止など)、`private_key_jwt` 対応、署名鍵の永続化なども必要です。

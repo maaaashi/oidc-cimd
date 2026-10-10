@@ -2,6 +2,7 @@
 // For learning purposes only. No dependencies (Node.js 22+).
 const http = require('node:http');
 const crypto = require('node:crypto');
+const dpop = require('../lib/dpop.js');
 
 const PORT = 3000;
 const ISSUER = process.env.ISSUER || 'http://localhost:3000';
@@ -275,6 +276,8 @@ const discovery = () => ({
   scopes_supported: SUPPORTED_SCOPES,
   token_endpoint_auth_methods_supported: ['none'],
   code_challenge_methods_supported: ['S256'],
+  // RFC 9449: this OP issues DPoP-bound tokens when the token request carries a DPoP proof.
+  dpop_signing_alg_values_supported: dpop.SUPPORTED_ALGS,
   authorization_response_iss_parameter_supported: true,
   client_id_metadata_document_supported: true,
 });
@@ -382,6 +385,17 @@ async function handleToken(req, res) {
     return sendJson(res, status, { error, error_description: description });
   };
 
+  // RFC 9449: a valid DPoP proof binds the issued tokens to the client's key (its thumbprint, jkt).
+  // Checked first, so that a bad proof does not use up the authorization code.
+  let jkt;
+  if (req.headers.dpop !== undefined) {
+    try {
+      jkt = dpop.verifyDpopProof(req.headers.dpop, { htm: 'POST', htu: `${ISSUER}/token` });
+    } catch (e) {
+      return tokenError('invalid_dpop_proof', e.message);
+    }
+  }
+
   let grant;
   if (form.grant_type === 'authorization_code') {
     grant = codes.get(form.code);
@@ -392,19 +406,32 @@ async function handleToken(req, res) {
     if (challenge !== grant.codeChallenge) return tokenError('invalid_grant', 'PKCE verification failed');
   } else if (form.grant_type === 'refresh_token') {
     grant = refreshTokens.get(form.refresh_token);
+    if (!grant || grant.expiresAt < Date.now()) {
+      refreshTokens.delete(form.refresh_token);
+      return tokenError('invalid_grant', 'refresh_token is invalid or expired');
+    }
+    // RFC 9449 §5: a public client's refresh token is bound to its DPoP key, so a stolen one is useless.
+    // Checked before rotation so that a thief cannot use up the legitimate client's refresh token.
+    if (grant.jkt && grant.jkt !== jkt) {
+      return tokenError('invalid_grant', 'refresh_token is bound to a different DPoP key');
+    }
     refreshTokens.delete(form.refresh_token); // rotation: public clients get a new refresh token each time
-    if (!grant || grant.expiresAt < Date.now()) return tokenError('invalid_grant', 'refresh_token is invalid or expired');
   } else {
     return tokenError('unsupported_grant_type', 'only authorization_code and refresh_token are supported');
   }
   if (form.client_id !== grant.clientId) return tokenError('invalid_client', 'client_id does not match', 401);
 
   // Re-check the client metadata (served from cache while fresh).
+  let client;
   try {
-    await getClientMetadata(grant.clientId);
+    client = await getClientMetadata(grant.clientId);
   } catch (e) {
     if (!(e instanceof ClientMetadataError)) throw e;
     return tokenError('invalid_client', e.message, 401);
+  }
+  // RFC 9449 §5.2: a client can declare in its metadata that it always uses DPoP.
+  if (client.dpop_bound_access_tokens === true && !jkt) {
+    return tokenError('invalid_dpop_proof', 'this client requires DPoP-bound access tokens');
   }
 
   // RFC 8707: the token request may narrow the audience to a subset of the authorized resources.
@@ -426,6 +453,7 @@ async function handleToken(req, res) {
       iat: now,
       exp: now + 300,
       jti: rand(16),
+      ...(jkt && { cnf: { jkt } }), // RFC 9449 §6: the key this token is bound to
     },
     'at+jwt',
   );
@@ -436,12 +464,13 @@ async function handleToken(req, res) {
     user: grant.user,
     scope: grant.scope,
     resources: grant.resources, // keeps the originally authorized resources, not just this token's audience
+    jkt,
     expiresAt: Date.now() + 60 * 60 * 1000,
   });
 
   const body = {
     access_token: accessToken,
-    token_type: 'Bearer',
+    token_type: jkt ? 'DPoP' : 'Bearer',
     expires_in: 300,
     scope: grant.scope,
     refresh_token: refreshToken,
@@ -458,7 +487,7 @@ async function handleToken(req, res) {
       ...(scopes.includes('email') && { email: grant.user.email }),
     });
   }
-  log(`issued tokens (${form.grant_type}) to ${grant.clientId}, aud=${JSON.stringify(audience)}`);
+  log(`issued tokens (${form.grant_type}) to ${grant.clientId}, aud=${JSON.stringify(audience)}${jkt ? `, DPoP jkt=${jkt}` : ''}`);
   sendJson(res, 200, body);
 }
 
