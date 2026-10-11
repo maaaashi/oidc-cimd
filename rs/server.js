@@ -11,16 +11,27 @@ const RESOURCE = process.env.RESOURCE || `http://localhost:${PORT}`; // this API
 const NAME = process.env.NAME || 'API';
 const ISSUER = process.env.ISSUER || 'http://localhost:3000';
 const MCP_SCOPE = 'mcp:tools';
+// RFC 8693: this API is also a confidential client of the OP, so that it can exchange the tokens it receives
+// for tokens to the downstream API it calls on the user's behalf. Its client_id is its resource identifier.
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const DOWNSTREAM = process.env.DOWNSTREAM;
+const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
 // RFC 9728 §3.1: for a resource without a path, the metadata lives at the root well-known URI.
 const RESOURCE_METADATA_URL = `${RESOURCE}/.well-known/oauth-protected-resource`;
 
 const log = (...a) => console.log(`[${NAME}] ${new Date().toISOString()}`, ...a);
 
+let asMetadata;
+async function getAsMetadata() {
+  asMetadata ??= await (await fetch(`${ISSUER}/.well-known/openid-configuration`)).json();
+  return asMetadata;
+}
+
 let jwksCache;
 async function getKey(kid) {
   if (!jwksCache?.some((k) => k.kid === kid)) {
-    const op = await (await fetch(`${ISSUER}/.well-known/openid-configuration`)).json();
-    jwksCache = (await (await fetch(op.jwks_uri)).json()).keys;
+    jwksCache = (await (await fetch((await getAsMetadata()).jwks_uri)).json()).keys;
   }
   const jwk = jwksCache.find((k) => k.kid === kid);
   if (!jwk) throw new Error('signing key not found');
@@ -116,6 +127,63 @@ async function authorize(req, res, requiredScope) {
   return at;
 }
 
+// --- RFC 8693: call the downstream API on the user's behalf -----------------
+const decodePayload = (jwt) => JSON.parse(Buffer.from(jwt.split('.')[1], 'base64url'));
+
+async function exchangeToken(subjectToken, { resource, scope }) {
+  const { token_endpoint } = await getAsMetadata();
+  const params = {
+    grant_type: TOKEN_EXCHANGE_GRANT,
+    subject_token: subjectToken,
+    subject_token_type: ACCESS_TOKEN_TYPE,
+    requested_token_type: ACCESS_TOKEN_TYPE,
+    resource,
+    scope,
+  };
+  // client_secret_basic: form-urlencode, then base64 (the client_id contains ":").
+  const basic = Buffer.from(`${encodeURIComponent(RESOURCE)}:${encodeURIComponent(CLIENT_SECRET)}`).toString('base64');
+  const r = await fetch(token_endpoint, {
+    method: 'POST',
+    headers: { 'content-type': 'application/x-www-form-urlencoded', authorization: `Basic ${basic}` },
+    body: new URLSearchParams(params),
+  });
+  const body = await r.json();
+  // Returned for the demo page, with the secrets left out.
+  return {
+    request: {
+      endpoint: `POST ${token_endpoint}`,
+      authorization: `Basic (client_id=${RESOURCE}, client_secret=***)`,
+      params: { ...params, subject_token: `${subjectToken.slice(0, 16)}...` },
+    },
+    status: r.status,
+    response: body,
+    ...(body.access_token && { issued_token_claims: decodePayload(body.access_token) }),
+  };
+}
+
+// mode: "exchange" (the right way), "passthrough" (forward the received token as is: must fail),
+// "escalate" (ask for a scope the user never granted: must fail).
+async function callDownstream(subjectToken, mode) {
+  const url = `${DOWNSTREAM}/api/data`;
+  const result = { mode };
+  let token = subjectToken;
+  if (mode !== 'passthrough') {
+    // Ask only for what the downstream call needs ("profile"), narrowing the received token's scope.
+    const scope = mode === 'escalate' ? `profile ${MCP_SCOPE}` : 'profile';
+    result.token_exchange = await exchangeToken(subjectToken, { resource: DOWNSTREAM, scope });
+    if (result.token_exchange.status !== 200) return result;
+    token = result.token_exchange.response.access_token;
+  }
+  const r = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+  const body = await r.json();
+  result.downstream = {
+    request: `GET ${url}`,
+    status: r.status,
+    body: r.ok ? body : { 'www-authenticate': r.headers.get('www-authenticate'), body },
+  };
+  return result;
+}
+
 // --- Minimal MCP server (Streamable HTTP transport, JSON responses only) ----
 const MCP_TOOLS = [
   {
@@ -181,8 +249,26 @@ http
         case 'GET /api/data': {
           const at = await authorize(req, res);
           if (!at) return;
-          log(`200 sub=${at.sub} client_id=${at.client_id}`);
-          return sendJson(res, 200, { api: NAME, resource: RESOURCE, message: `Hello ${at.sub} from ${NAME}`, client_id: at.client_id });
+          log(`200 sub=${at.sub} client_id=${at.client_id}${at.act ? ` act=${JSON.stringify(at.act)}` : ''}`);
+          return sendJson(res, 200, {
+            api: NAME,
+            resource: RESOURCE,
+            message: `Hello ${at.sub} from ${NAME}`,
+            client_id: at.client_id,
+            ...(at.act && { act: at.act }), // RFC 8693: called by another API on the user's behalf
+          });
+        }
+
+        // Calls DOWNSTREAM on behalf of the user who called this API (RFC 8693 token exchange).
+        case 'GET /api/downstream': {
+          const at = await authorize(req, res);
+          if (!at) return;
+          const token = /^(?:Bearer|DPoP) (.+)$/.exec(req.headers.authorization)[1];
+          const mode = new URL(req.url, RESOURCE).searchParams.get('mode') || 'exchange';
+          const result = await callDownstream(token, mode);
+          const ok = result.downstream?.status === 200;
+          log(`downstream (${mode}) -> ${ok ? 'OK' : 'failed'}`);
+          return sendJson(res, ok ? 200 : 502, { api: NAME, ...result });
         }
 
         case 'POST /mcp': {

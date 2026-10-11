@@ -15,6 +15,11 @@ const MAX_CACHE_SEC = 24 * 60 * 60;
 const KNOWN_RESOURCES = (process.env.RESOURCES || '').split(',').filter(Boolean);
 // "mcp:tools" is what the demo MCP servers (rs/server.js) require.
 const SUPPORTED_SCOPES = ['openid', 'profile', 'email', 'mcp:tools'];
+// RFC 8693: confidential clients (the demo APIs) that may exchange tokens, and the downstream APIs each may call.
+// { "<client_id>": { "client_secret": "...", "allowed_targets": ["<resource>", ...] } }
+const TOKEN_EXCHANGE_CLIENTS = JSON.parse(process.env.TOKEN_EXCHANGE_CLIENTS || '{}');
+const TOKEN_EXCHANGE_GRANT = 'urn:ietf:params:oauth:grant-type:token-exchange';
+const ACCESS_TOKEN_TYPE = 'urn:ietf:params:oauth:token-type:access_token';
 
 const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const kid = crypto.randomBytes(8).toString('hex');
@@ -270,11 +275,12 @@ const discovery = () => ({
   token_endpoint: `${ISSUER}/token`,
   jwks_uri: `${ISSUER}/jwks`,
   response_types_supported: ['code'],
-  grant_types_supported: ['authorization_code', 'refresh_token'],
+  grant_types_supported: ['authorization_code', 'refresh_token', TOKEN_EXCHANGE_GRANT],
   subject_types_supported: ['public'],
   id_token_signing_alg_values_supported: ['RS256'],
   scopes_supported: SUPPORTED_SCOPES,
-  token_endpoint_auth_methods_supported: ['none'],
+  // "none" for CIMD public clients; client_secret_basic for the APIs doing token exchange.
+  token_endpoint_auth_methods_supported: ['none', 'client_secret_basic'],
   code_challenge_methods_supported: ['S256'],
   // RFC 9449: this OP issues DPoP-bound tokens when the token request carries a DPoP proof.
   dpop_signing_alg_values_supported: dpop.SUPPORTED_ALGS,
@@ -380,9 +386,9 @@ async function handleDecision(req, res) {
 async function handleToken(req, res) {
   const params = await readForm(req);
   const form = Object.fromEntries(params);
-  const tokenError = (error, description, status = 400) => {
+  const tokenError = (error, description, status = 400, headers = {}) => {
     log(`token error: ${error} - ${description}`);
-    return sendJson(res, status, { error, error_description: description });
+    return sendJson(res, status, { error, error_description: description }, headers);
   };
 
   // RFC 9449: a valid DPoP proof binds the issued tokens to the client's key (its thumbprint, jkt).
@@ -395,6 +401,8 @@ async function handleToken(req, res) {
       return tokenError('invalid_dpop_proof', e.message);
     }
   }
+
+  if (form.grant_type === TOKEN_EXCHANGE_GRANT) return handleTokenExchange(req, res, params, jkt, tokenError);
 
   let grant;
   if (form.grant_type === 'authorization_code') {
@@ -417,7 +425,7 @@ async function handleToken(req, res) {
     }
     refreshTokens.delete(form.refresh_token); // rotation: public clients get a new refresh token each time
   } else {
-    return tokenError('unsupported_grant_type', 'only authorization_code and refresh_token are supported');
+    return tokenError('unsupported_grant_type', 'only authorization_code, refresh_token and token-exchange are supported');
   }
   if (form.client_id !== grant.clientId) return tokenError('invalid_client', 'client_id does not match', 401);
 
@@ -489,6 +497,123 @@ async function handleToken(req, res) {
   }
   log(`issued tokens (${form.grant_type}) to ${grant.clientId}, aud=${JSON.stringify(audience)}${jkt ? `, DPoP jkt=${jkt}` : ''}`);
   sendJson(res, 200, body);
+}
+
+// --- RFC 8693: Token Exchange -------------------------------------------------
+// RFC 6749 §2.3.1 client_secret_basic. client_id and secret are form-urlencoded before base64,
+// which matters here because the APIs' client_ids are URLs containing ":".
+function authenticateClient(req) {
+  const m = /^Basic (.+)$/.exec(req.headers.authorization || '');
+  if (!m) return null;
+  const decoded = Buffer.from(m[1], 'base64').toString('utf8');
+  const i = decoded.indexOf(':');
+  if (i < 0) return null;
+  let clientId, secret;
+  try {
+    [clientId, secret] = [decoded.slice(0, i), decoded.slice(i + 1)].map((v) => decodeURIComponent(v.replace(/\+/g, ' ')));
+  } catch {
+    return null;
+  }
+  const client = Object.hasOwn(TOKEN_EXCHANGE_CLIENTS, clientId) && TOKEN_EXCHANGE_CLIENTS[clientId];
+  if (!client) return null;
+  const a = Buffer.from(secret);
+  const b = Buffer.from(client.client_secret);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  return { clientId, ...client };
+}
+
+// Verifies an access token this OP issued (the subject_token of a token exchange).
+function verifyOwnAccessToken(token) {
+  const [h, p, s] = String(token ?? '').split('.');
+  if (!s) throw new Error('malformed token');
+  let header, payload;
+  try {
+    header = JSON.parse(Buffer.from(h, 'base64url'));
+    payload = JSON.parse(Buffer.from(p, 'base64url'));
+  } catch {
+    throw new Error('malformed token');
+  }
+  if (header.alg !== 'RS256' || header.typ !== 'at+jwt' || header.kid !== kid) throw new Error('not an access token issued by this OP');
+  if (!crypto.verify('sha256', Buffer.from(`${h}.${p}`), publicKey, Buffer.from(s, 'base64url'))) throw new Error('invalid signature');
+  if (payload.iss !== ISSUER) throw new Error('iss mismatch');
+  if (payload.exp * 1000 < Date.now()) throw new Error('token expired');
+  return payload;
+}
+
+// A resource server (the actor) trades the access token it received (the subject token) for a new one,
+// addressed to the downstream API it needs to call on the user's behalf. Forwarding the original token
+// instead ("token passthrough") would fail at the downstream API's aud check, and must not be done anyway.
+async function handleTokenExchange(req, res, params, jkt, tokenError) {
+  const form = Object.fromEntries(params);
+  const actor = authenticateClient(req);
+  if (!actor) {
+    return tokenError('invalid_client', 'token exchange requires client authentication (client_secret_basic)', 401, {
+      'www-authenticate': 'Basic realm="token"',
+    });
+  }
+
+  if (form.subject_token_type !== ACCESS_TOKEN_TYPE) return tokenError('invalid_request', `subject_token_type must be ${ACCESS_TOKEN_TYPE}`);
+  if (form.requested_token_type && form.requested_token_type !== ACCESS_TOKEN_TYPE) {
+    return tokenError('invalid_request', 'only access tokens can be requested');
+  }
+  // Here the actor is the authenticated client itself, so a separate actor_token is not needed.
+  if (form.actor_token) return tokenError('invalid_request', 'actor_token is not supported by this demo OP');
+
+  let subject;
+  try {
+    subject = verifyOwnAccessToken(form.subject_token);
+  } catch (e) {
+    return tokenError('invalid_request', `subject_token is invalid: ${e.message}`);
+  }
+  // An API may only exchange tokens that were sent to it, not ones addressed to someone else.
+  if (![].concat(subject.aud).includes(actor.clientId)) {
+    return tokenError('invalid_request', `subject_token audience ${JSON.stringify(subject.aud)} does not include ${actor.clientId}`);
+  }
+
+  const resources = params.getAll('resource');
+  if (resources.length !== 1) return tokenError('invalid_target', 'exactly one resource is required');
+  const resourceError = validateResources(resources);
+  if (resourceError) return tokenError('invalid_target', resourceError);
+  const [target] = resources;
+  // Which API may call which is the OP's policy, not something an API can decide for itself.
+  if (!actor.allowed_targets?.includes(target)) {
+    return tokenError('invalid_target', `${actor.clientId} is not allowed to obtain tokens for ${target}`);
+  }
+
+  // The new token may narrow the subject token's scope, never widen it.
+  const subjectScopes = (subject.scope || '').split(' ').filter(Boolean);
+  const requestedScopes = (form.scope || '').split(' ').filter(Boolean);
+  const extra = requestedScopes.find((s) => !subjectScopes.includes(s));
+  if (extra) return tokenError('invalid_scope', `scope "${extra}" was not granted to the subject_token`);
+  const scope = (requestedScopes.length ? requestedScopes : subjectScopes).join(' ');
+
+  const now = Math.floor(Date.now() / 1000);
+  const exp = Math.min(subject.exp, now + 300); // never outlives the token it was derived from
+  const accessToken = signJwt(
+    {
+      iss: ISSUER,
+      sub: subject.sub, // still the user: the actor acts on their behalf (delegation), not as them
+      aud: target,
+      client_id: actor.clientId,
+      scope,
+      iat: now,
+      exp,
+      jti: rand(16),
+      // RFC 8693 §4.1: who is acting. A nested act keeps the earlier actors of a delegation chain.
+      act: { sub: actor.clientId, ...(subject.act && { act: subject.act }) },
+      ...(jkt && { cnf: { jkt } }),
+    },
+    'at+jwt',
+  );
+  log(`token exchange: ${actor.clientId} acting for ${subject.sub}, aud=${target}, scope="${scope}"`);
+  // No refresh token: the actor should exchange again (with a fresh subject token) when this one expires.
+  sendJson(res, 200, {
+    access_token: accessToken,
+    issued_token_type: ACCESS_TOKEN_TYPE,
+    token_type: jkt ? 'DPoP' : 'Bearer',
+    expires_in: exp - now,
+    scope,
+  });
 }
 
 function handleIndex(res) {

@@ -219,13 +219,15 @@ ${hint(
   // This flow uses DPoP throughout: every token request and API call carries a proof from dpopKey.
   const tokenRequest = (pairs, key = dpopKey) => requestToken(op, pairs, key);
   // Options let the attack steps send the token as Bearer, sign with another key, or replay an old proof.
-  const callApi = async (api, accessToken, { scheme = 'DPoP', key = dpopKey, proof } = {}) => {
-    const url = `${api}/api/data`;
+  const callApi = async (api, accessToken, { scheme = 'DPoP', key = dpopKey, proof, path = '/api/data', query = '' } = {}) => {
+    const url = `${api}${path}`;
+    // htu is the URL without the query.
     proof ??= key && createDpopProof(key, 'GET', url, accessToken);
     try {
-      const r = await fetch(url, { headers: { authorization: `${scheme} ${accessToken}`, ...(proof && { dpop: proof }) } });
+      const r = await fetch(`${url}${query}`, { headers: { authorization: `${scheme} ${accessToken}`, ...(proof && { dpop: proof }) } });
       const body = await r.json();
-      return { status: r.status, body: r.ok ? body : { 'www-authenticate': r.headers.get('www-authenticate'), body }, proof };
+      const wwwAuthenticate = r.headers.get('www-authenticate');
+      return { status: r.status, body: wwwAuthenticate ? { 'www-authenticate': wwwAuthenticate, body } : body, proof };
     } catch (e) {
       return { status: 'error', body: { error: `cannot reach ${api}: ${e.cause?.code || e.message}` } };
     }
@@ -293,6 +295,13 @@ ${hint(
     ['client_id', flow.clientId],
     ['resource', NOT_AUTHORIZED_RESOURCE],
   ]);
+
+  // 6) RFC 8693 Token Exchange: API A calls API B on the user's behalf. The client only talks to API A.
+  const downstream = (api, token, mode) => callApi(api, token, { path: '/api/downstream', query: `?mode=${mode}` });
+  const exchangeAtoB = await downstream(API_A, tokenA, 'exchange');
+  const passthrough = await downstream(API_A, tokenA, 'passthrough');
+  const escalate = await downstream(API_A, tokenA, 'escalate');
+  const exchangeBtoA = tokenB ? await downstream(API_B, tokenB, 'exchange') : { status: '-', body: 'no token' };
 
   log(`login succeeded: sub=${idToken.payload.sub}`);
 
@@ -452,6 +461,84 @@ ${step(
 攻撃者の鍵の proof では <code>invalid_grant</code> になります。</p>
 <p>このデモの OP は、鍵が違う場合はリフレッシュトークンを消費しない (ローテーションしない) ようにしています。
 攻撃者が正規のクライアントのリフレッシュトークンを使えなくする、という嫌がらせを防ぐためです。⑥ はこの後、同じリフレッシュトークンを正しい鍵で使っています。</p>`,
+)}
+<div class="card"><h1>Token Exchange (RFC 8693): API が別の API をユーザーの代わりに呼ぶ</h1>
+<p>クライアントは API A の <code>/api/downstream</code> を呼ぶだけです。API A は処理の途中で API B のデータが必要になり、
+ユーザー (alice) の代わりに API B を呼びます。</p>
+<pre>Client ──GET /api/downstream (DPoP AT, aud=API A)──▶ API A
+API A  ──POST /token  grant_type=token-exchange
+                      subject_token=&lt;受け取った AT&gt;  resource=API B  scope=profile
+                      Authorization: Basic (API A の client_id / secret)──▶ OP
+       ◀── AT (aud=API B, sub=alice, act.sub=API A)
+API A  ──GET /api/data (Bearer 新しい AT)──▶ API B</pre>
+${hint(
+  'なぜ受け取ったトークンをそのまま転送してはいけないの?',
+  `<p>API A が受け取ったトークンの <code>aud</code> は API A です。これを API B に転送する (トークンパススルー) と、</p>
+<ul>
+<li>API B が <code>aud</code> を正しく検証していれば、④ と同じく拒否されます</li>
+<li>検証が甘い API B なら通ってしまい、「API A 宛てのトークンがどこでも使える」状態になります (④ で防いだはずの問題が戻ってくる)</li>
+<li>API B のログには「クライアントが直接呼んだ」としか残らず、API A が間に入ったことがわかりません</li>
+</ul>
+<p>そこで API A は OP に「このトークンを持ってきたユーザーの代わりに、API B を呼ぶためのトークンをください」と頼みます。これが Token Exchange です。
+MCP の仕様がトークンパススルーを禁止しているのも同じ理由で、MCP サーバーが上流の API を呼ぶときの正しいやり方がこれです。</p>`,
+  true,
+)}
+${hint(
+  'OP は何を確認している?',
+  `<dl>
+<dt>API A 自身の認証 (<code>client_secret_basic</code>)</dt><dd>交換を頼んでいるのが本当に API A であること。API A は CIMD の公開クライアントとは違い、シークレットを持てるサーバーなので、事前登録したコンフィデンシャルクライアントにしています。</dd>
+<dt>subject_token の検証</dt><dd>OP 自身が発行した、期限内のアクセストークンであること。</dd>
+<dt>subject_token の <code>aud</code> が API A であること</dt><dd>API A は「自分宛てに届いたトークン」しか交換できません。どこかで拾った他の API 宛てのトークンは交換できません。</dd>
+<dt>交換先 (<code>resource</code>) が許可されていること</dt><dd>どの API がどの API を呼んでよいかは OP 側のポリシーで決めます (このデモでは API A → API B だけを許可)。</dd>
+<dt>scope を広げないこと</dt><dd>新しいトークンの scope は subject_token の scope の範囲内に限られます。絞ることはできますが、広げることはできません。</dd>
+<dt>有効期限を延ばさないこと</dt><dd>新しいトークンの <code>exp</code> は subject_token の <code>exp</code> を超えません。リフレッシュトークンも発行しません。</dd>
+</dl>`,
+)}</div>
+${step(
+  '⑪ API A → (Token Exchange) → API B',
+  'API A が受け取ったトークンを API B 用に交換して呼ぶ',
+  exchangeAtoB,
+  200,
+  '',
+  `<p><code>token_exchange.issued_token_claims</code> が OP の発行した新しいトークンです。次の点に注目してください。</p>
+<dl>
+<dt>sub</dt><dd>alice のまま。API A は alice <b>として</b> ではなく、alice の <b>代わりに</b> 呼んでいます。</dd>
+<dt>act (actor)</dt><dd>「実際に呼んでいるのは API A」という記録です (RFC 8693 §4.1)。API B は「alice 本人ではなく API A が代理で来た」とわかるので、
+代理アクセスを拒否したり、監査ログに残したりできます。さらに API B が別の API を呼ぶと <code>act</code> が入れ子になり、代理の連鎖をたどれます。</dd>
+<dt>aud / client_id</dt><dd>宛先は API B、トークンを受け取ったクライアントは API A です。</dd>
+<dt>scope</dt><dd>元のトークンの <code>openid profile email</code> から、API B に必要な <code>profile</code> だけに絞っています。</dd>
+<dt>exp</dt><dd>元のトークンの期限を超えません。</dd>
+</dl>
+<p>元のトークンは DPoP でクライアントの鍵に紐付いていましたが、新しいトークンは API A がシークレットで認証して受け取った Bearer トークンです。
+API A も DPoP proof を付けて交換すれば、API A の鍵に紐付けることもできます。</p>`,
+)}
+${step(
+  '⑫ API A が受け取ったトークンをそのまま API B に転送する (パススルー)',
+  'トークンの <code>aud</code> は API A なので API B は拒否する',
+  passthrough,
+  502,
+  '',
+  `<p>交換をせずに、受け取ったトークンをそのまま API B に送った場合です。API B は <code>aud</code> が自分ではないので 401 を返し、
+API A はクライアントに 502 を返しています。<code>aud</code> を API ごとに絞っておくことが、パススルーへの防御にもなっています。</p>`,
+)}
+${step(
+  '⑬ 交換時に元のトークンに無い scope を要求する',
+  '<code>scope=profile mcp:tools</code> → <code>invalid_scope</code>',
+  escalate,
+  502,
+  '',
+  `<p>元のトークンの scope は <code>openid profile email</code> で、ユーザーは <code>mcp:tools</code> に同意していません。
+API A が交換を利用して権限を広げることはできないので、OP は <code>invalid_scope</code> で拒否します。</p>`,
+)}
+${step(
+  '⑭ API B → (Token Exchange) → API A',
+  'OP のポリシーで API B → API A は許可していないので <code>invalid_target</code>',
+  exchangeBtoA,
+  502,
+  '',
+  `<p>API B も OP に登録されたクライアントで、正しい API B 宛てのトークンを持っています。
+しかし OP のポリシーでは API B に交換先を許可していないので、<code>invalid_target</code> になります。
+どの API がどの API をユーザーの代わりに呼んでよいかは、各 API ではなく OP が一元的に管理します。</p>`,
 )}
 <a class="btn" href="/">トップへ</a>`,
   );
@@ -733,7 +820,8 @@ client_id = <code><a href="/client-metadata.json">${esc(CLIENT_ID)}</a></code></
 <p><a class="btn" href="/login">OP でログイン</a></p>
 <p>ログイン後、Resource Indicators (RFC 8707) で API ごとに <code>aud</code> を絞ったアクセストークンを取得し、
 <code>${esc(API_A)}</code> / <code>${esc(API_B)}</code> を呼び分けます。
-トークンは DPoP (RFC 9449) でこのアプリの鍵に紐付け、盗まれたトークンが使えないことも確認します。</p>
+トークンは DPoP (RFC 9449) でこのアプリの鍵に紐付け、盗まれたトークンが使えないことも確認します。
+最後に、API A がユーザーの代わりに API B を呼ぶ Token Exchange (RFC 8693) も試します。</p>
 ${hint(
   'ボタンを押すと何が起きる? (認可コードフロー)',
   `<ol>
