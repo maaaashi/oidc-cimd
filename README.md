@@ -5,6 +5,7 @@
 さらに [Resource Indicators (RFC 8707)](https://www.rfc-editor.org/rfc/rfc8707) で、**アクセストークンの `aud` を API ごとに絞る** 動きも確認できます。
 [Protected Resource Metadata (RFC 9728)](https://www.rfc-editor.org/rfc/rfc9728) と組み合わせた **MCP の認可フロー** も試せます。
 [DPoP (RFC 9449)](https://www.rfc-editor.org/rfc/rfc9449) で、**トークンをクライアントの鍵に紐付け、盗まれても使えなくする** 動きも確認できます。
+[PAR (RFC 9126)](https://www.rfc-editor.org/rfc/rfc9126) で、**認可リクエストをブラウザの URL に載せず、OP に直接送る** 動きも確認できます。
 
 ## 起動
 
@@ -34,8 +35,10 @@ DPoP proof の検証は OP と API で共通なので `lib/dpop.js` にまとめ
 ## 流れ
 
 ```
-Browser ──(1) /authorize?client_id=http://localhost:4000/client-metadata.json──▶ OP
-OP ──(2) GET http://localhost:4000/client-metadata.json──▶ Client
+Client ──(0) POST /par (client_id=http://localhost:4000/client-metadata.json, redirect_uri, scope, resource, PKCE ...)──▶ OP
+       ◀── request_uri  (PAR, 後述)
+Browser ──(1) /authorize?client_id=...&request_uri=...──▶ OP
+OP ──(2) GET http://localhost:4000/client-metadata.json──▶ Client   ※ 実際は (0) の時点で取得
 OP: (3) 検証 → 同意画面に client_name / logo_uri / ドメインを表示
 Browser ──(4) code──▶ Client ──(5) /token (client_id + PKCE, シークレット無し)──▶ OP
 ```
@@ -131,15 +134,43 @@ Client ──(7) 同じ AT で http://localhost:5001/mcp → 401 (audience 不�
 - `mcp:tools` を持たないトークン (OIDC フローで取ったもの) で `/mcp` を呼ぶと `403 insufficient_scope`
 - 別の MCP サーバー用のトークンは `aud` で拒否される (MCP 仕様が禁止している「トークンのパススルー」を防ぐ)
 
+## PAR (RFC 9126)
+
+通常ログインと MCP 風フローは、認可リクエストを PAR で送っています。
+
+```
+Client ──POST /par  client_id, redirect_uri, scope, resource, state, nonce, code_challenge ...
+                    DPoP: <proof(htm=POST, htu=/par)>──▶ OP
+       ◀── 201 { request_uri: "urn:ietf:params:oauth:request_uri:...", expires_in: 60 }
+Browser ──GET /authorize?client_id=<メタデータURL>&request_uri=urn:...──▶ OP   ← URL に載るのはこの 2 つだけ
+```
+
+- OP は `/par` で、`/authorize` と同じ検証 (CIMD メタデータ・redirect_uri・scope・PKCE・resource) を行う。エラーはブラウザを経由せず、JSON で直接クライアントに返る
+- `/authorize` では `request_uri` が指す中身 **だけ** を使い、URL に付いた他のパラメーターは無視する (改ざん防止)
+- `request_uri` は 60 秒で失効し、1 回しか使えない。PAR を送ったクライアントの client_id とセットでないと使えない
+- CIMD のメタデータに `"require_pushed_authorization_requests": true` を書いているので、OP はこのクライアントの PAR 無しの認可リクエストを `invalid_request` で拒否する
+- PAR に DPoP proof を付けると、OP はその鍵の thumbprint (`dpop_jkt`) を認可コードに紐付ける (RFC 9449 §10)。コードは同じ鍵の proof を付けたトークンリクエストでしか交換できない
+- OP は discovery で `pushed_authorization_request_endpoint` と `require_pushed_authorization_requests: false` (OP 全体では任意) を公開。MCP 風フローのクライアントは、AS メタデータにこれがあれば PAR を使う
+
+トップページの「PAR の動きを試す」:
+
+| 操作 | 結果 |
+|---|---|
+| PAR を使わず URL で送る | URL に全パラメーターが並ぶ。**`error=invalid_request`** (このクライアントは PAR 必須) |
+| PAR の後、URL に `scope` / `resource` / `redirect_uri` を書き足す | **無視される**。同意画面に表示され、トークンは PAR で送った内容どおり |
+| `request_uri` を先に他者が使う | **OP のエラー画面** (使い捨て) |
+| `request_uri` を別の client_id と組み合わせる | **OP のエラー画面** (クライアントに紐付いている) |
+
 ## 失敗パターン
 
 トップページの「失敗パターンを試す」から、OP がどう弾くかを確認できます。
+最初の 4 つは、OP の画面でのエラー表示を見るため、あえて PAR を使わずに URL で送っています。
 
 - メタデータに無い redirect_uri
 - ドキュメント内 client_id と URL の不一致
 - ドキュメントが 404
 - パスの無い client_id URL
-- OP が知らない resource を要求 (`invalid_target` でクライアントに返る)
+- OP が知らない resource を要求 (PAR で送るので、`invalid_target` が JSON で直接クライアントに返る)
 
 http://localhost:3000 では OP がキャッシュしているメタデータを確認できます。
 
@@ -148,6 +179,7 @@ http://localhost:3000 では OP がキャッシュしているメタデータを
 - 仕様上 client_id URL は **https 必須** です。ローカルで試すため、OP は `ALLOW_HTTP_LOCALHOST_CLIENT_ID=true` のときだけ `http://localhost` を許可しています。
 - ブラウザと各プロセスから同じ `localhost:<port>` に届くよう、全プロセスを 1 コンテナで動かしています。
 - リフレッシュトークンはローテーションしますが、再利用検知などはしていません。
-- DPoP の `DPoP-Nonce` (サーバー提供の nonce) と、認可リクエストの `dpop_jkt` (認可コードの鍵への紐付け) は実装していません。使用済み `jti` はプロセスごとのメモリに保持しています。
+- DPoP の `DPoP-Nonce` (サーバー提供の nonce) は実装していません。使用済み `jti` と PAR の `request_uri` はプロセスごとのメモリに保持しています。
+- PAR のリクエストオブジェクト (JAR, RFC 9101 の署名付き `request`) には対応していません。
 - MCP サーバーは JSON-RPC を JSON で返すだけの最小実装です (SSE・セッション管理なし)。PRM の `resource` は MCP エンドポイントの親 (`http://localhost:5000`) にしており、クライアントはパスの前方一致で検証しています。
 - 本番では SSRF 対策 (内部 IP への取得禁止など)、`private_key_jwt` 対応、署名鍵の永続化なども必要です。

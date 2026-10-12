@@ -30,6 +30,8 @@ const USERS = {
 };
 
 const pending = new Map(); // authorization request id -> request
+const pushedRequests = new Map(); // RFC 9126 request_uri -> request
+const PAR_EXPIRES_SEC = 60;
 const codes = new Map(); // authorization code -> grant
 const refreshTokens = new Map(); // refresh token -> grant
 const metadataCache = new Map(); // client_id -> { metadata, fetchedAt, expiresAt }
@@ -211,6 +213,33 @@ ${hint(
     { 'content-type': 'text/html; charset=utf-8' },
   );
 
+function parNotice(req) {
+  if (!req.par) {
+    return `<p>受け取り方: ブラウザの URL (フロントチャネル)</p>`;
+  }
+  const { requestUri, ignored } = req.par;
+  return `<p>受け取り方: <b>PAR</b> (クライアントから直接 POST) ・ <code>${esc(requestUri)}</code>${
+    req.dpopJkt ? `<br>認可コードの紐付け先 DPoP 鍵 (dpop_jkt): <code>${esc(req.dpopJkt)}</code>` : ''
+  }</p>
+  ${
+    ignored.length
+      ? `<p class="err card">URL に <code>request_uri</code> 以外のパラメーターが付いていましたが、無視しました:
+<code>${esc(new URLSearchParams(ignored).toString())}</code></p>`
+      : ''
+  }
+  ${hint(
+    'PAR (Pushed Authorization Requests) とは?',
+    `<p>このリクエストの中身 (scope・resource・redirect_uri など) は、ブラウザの URL ではなく、
+クライアントから OP へ直接 POST されたものです (RFC 9126)。ブラウザの URL には <code>client_id</code> と
+<code>request_uri</code> (中身を指す使い捨ての参照番号) しか載っていません。</p>
+<ul>
+<li>URL を書き換えられても、OP は POST された中身しか使わないので改ざんできません</li>
+<li>URL の履歴やログに、要求内容 (どの API にアクセスするかなど) が残りません</li>
+<li><code>request_uri</code> は 1 回しか使えず、${PAR_EXPIRES_SEC} 秒で失効します</li>
+</ul>`,
+  )}`;
+}
+
 function consentPage(id, req, error) {
   const c = req.client;
   const host = new URL(req.clientId).host;
@@ -231,6 +260,7 @@ function consentPage(id, req, error) {
     req.resources.length ? req.resources.map((r) => `<code>${esc(r)}</code>`).join(' ') : '(指定なし)'
   }</p>
   <p>戻り先: <code>${esc(req.redirectUri)}</code></p>
+  ${parNotice(req)}
   <form method="post" action="/authorize/decision">
     <input type="hidden" name="id" value="${esc(id)}">
     <div>ユーザー名<br><input name="username" value="alice"></div>
@@ -274,6 +304,9 @@ const discovery = () => ({
   authorization_endpoint: `${ISSUER}/authorize`,
   token_endpoint: `${ISSUER}/token`,
   jwks_uri: `${ISSUER}/jwks`,
+  // RFC 9126: PAR is offered to every client; a client can make it mandatory for itself in its metadata.
+  pushed_authorization_request_endpoint: `${ISSUER}/par`,
+  require_pushed_authorization_requests: false,
   response_types_supported: ['code'],
   grant_types_supported: ['authorization_code', 'refresh_token', TOKEN_EXCHANGE_GRANT],
   subject_types_supported: ['public'],
@@ -288,9 +321,15 @@ const discovery = () => ({
   client_id_metadata_document_supported: true,
 });
 
-async function handleAuthorize(res, params) {
+// Validates the parameters of an authorization request, wherever they came from: the browser's URL (/authorize)
+// or the client's direct POST (/par, RFC 9126). Returns { req } or { error, description, redirectable }.
+// Errors found before redirect_uri is verified are not redirectable: that redirect_uri may be an attacker's site.
+async function parseAuthorizationRequest(params, { channel }) {
+  const fail = (error, description, redirectable = true) => ({ error, description, redirectable, redirectUri, state });
   const clientId = params.get('client_id');
-  if (!clientId) return errorPage(res, 'client_id is missing');
+  const redirectUri = params.get('redirect_uri');
+  const state = params.get('state');
+  if (!clientId) return fail('invalid_client', 'client_id is missing', false);
 
   let client;
   try {
@@ -298,57 +337,129 @@ async function handleAuthorize(res, params) {
   } catch (e) {
     if (!(e instanceof ClientMetadataError)) throw e;
     log(`client metadata rejected: ${e.message}`);
-    return errorPage(res, e.message);
+    return fail('invalid_client', e.message, false);
   }
 
-  const redirectUri = params.get('redirect_uri');
   if (!client.redirect_uris.includes(redirectUri)) {
     log(`redirect_uri rejected: ${redirectUri}`);
-    return errorPage(res, `redirect_uri "${redirectUri}" is not listed in the client metadata document's redirect_uris`);
+    return fail('invalid_request', `redirect_uri "${redirectUri}" is not listed in the client metadata document's redirect_uris`, false);
   }
 
-  // From here on, errors are returned to the (verified) redirect_uri.
-  const state = params.get('state');
-  const redirectError = (error, description) => {
-    const u = new URL(redirectUri);
-    u.searchParams.set('error', error);
-    u.searchParams.set('error_description', description);
-    if (state) u.searchParams.set('state', state);
-    u.searchParams.set('iss', ISSUER);
-    return redirect(res, u.href);
-  };
-
-  if (params.get('response_type') !== 'code') return redirectError('unsupported_response_type', 'only "code" is supported');
+  // From here on, errors may be returned to the (verified) redirect_uri.
+  // RFC 9126 §6: a client can declare in its metadata that it always uses PAR, so a front-channel request is refused.
+  if (channel === 'front' && client.require_pushed_authorization_requests === true) {
+    return fail('invalid_request', 'this client requires pushed authorization requests (PAR)');
+  }
+  if (params.get('response_type') !== 'code') return fail('unsupported_response_type', 'only "code" is supported');
   // Plain OAuth (e.g. MCP clients asking only for "mcp:tools") is allowed; an ID token is issued only with "openid".
   const scope = params.get('scope') || '';
   const unknownScope = scope.split(' ').find((s) => s && !SUPPORTED_SCOPES.includes(s));
-  if (!scope.trim()) return redirectError('invalid_scope', 'scope is required');
-  if (unknownScope) return redirectError('invalid_scope', `unsupported scope "${unknownScope}"`);
+  if (!scope.trim()) return fail('invalid_scope', 'scope is required');
+  if (unknownScope) return fail('invalid_scope', `unsupported scope "${unknownScope}"`);
   if (!params.get('code_challenge') || params.get('code_challenge_method') !== 'S256') {
-    return redirectError('invalid_request', 'PKCE with S256 is required');
+    return fail('invalid_request', 'PKCE with S256 is required');
   }
   // RFC 8707: the resource parameter may be repeated to request access to multiple APIs.
   const resources = params.getAll('resource');
   const resourceError = validateResources(resources);
   if (resourceError) {
     log(`resource rejected: ${resourceError}`);
-    return redirectError('invalid_target', resourceError);
+    return fail('invalid_target', resourceError);
   }
 
-  const id = rand(16);
-  const req = {
-    clientId,
-    client,
-    redirectUri,
-    state,
-    scope,
-    resources,
-    nonce: params.get('nonce'),
-    codeChallenge: params.get('code_challenge'),
-    expiresAt: Date.now() + 10 * 60 * 1000,
+  return {
+    req: {
+      clientId,
+      client,
+      redirectUri,
+      state,
+      scope,
+      resources,
+      nonce: params.get('nonce'),
+      codeChallenge: params.get('code_challenge'),
+      // RFC 9449 §10: binds the authorization code to a DPoP key (set from the proof when pushed via PAR).
+      dpopJkt: params.get('dpop_jkt') || undefined,
+    },
   };
-  pending.set(id, req);
+}
+
+function redirectError(res, { redirectUri, state, error, description }) {
+  const u = new URL(redirectUri);
+  u.searchParams.set('error', error);
+  u.searchParams.set('error_description', description);
+  if (state) u.searchParams.set('state', state);
+  u.searchParams.set('iss', ISSUER);
+  return redirect(res, u.href);
+}
+
+function showConsent(res, req) {
+  const id = rand(16);
+  pending.set(id, { ...req, expiresAt: Date.now() + 10 * 60 * 1000 });
   send(res, 200, consentPage(id, req), { 'content-type': 'text/html; charset=utf-8' });
+}
+
+async function handleAuthorize(res, params) {
+  if (params.has('request_uri')) return handlePushedAuthorize(res, params);
+  const r = await parseAuthorizationRequest(params, { channel: 'front' });
+  if (r.error && !r.redirectable) return errorPage(res, r.description);
+  if (r.error) return redirectError(res, r);
+  showConsent(res, r.req);
+}
+
+// --- RFC 9126: Pushed Authorization Requests ----------------------------------
+// The client POSTs the authorization request straight to the OP and gets back a short-lived, one-time request_uri.
+// Only client_id + request_uri then travel through the browser, so the parameters can be neither read nor altered there.
+async function handlePar(req, res) {
+  const params = await readForm(req);
+  const parError = (error, description, status = 400) => {
+    log(`PAR error: ${error} - ${description}`);
+    return sendJson(res, status, { error, error_description: description });
+  };
+  if (params.has('request_uri')) return parError('invalid_request', 'request_uri must not be pushed');
+
+  // RFC 9449 §10.1: a DPoP proof sent to the PAR endpoint binds the authorization code to that key.
+  let proofJkt;
+  if (req.headers.dpop !== undefined) {
+    try {
+      proofJkt = dpop.verifyDpopProof(req.headers.dpop, { htm: 'POST', htu: `${ISSUER}/par` });
+    } catch (e) {
+      return parError('invalid_dpop_proof', e.message);
+    }
+  }
+
+  // Same checks as the front channel, but every error goes back to the client as JSON:
+  // it is the client, not the browser, that is talking to us.
+  const r = await parseAuthorizationRequest(params, { channel: 'par' });
+  if (r.error) return parError(r.error, r.description, r.error === 'invalid_client' ? 401 : 400);
+  if (proofJkt) {
+    if (r.req.dpopJkt && r.req.dpopJkt !== proofJkt) return parError('invalid_dpop_proof', 'dpop_jkt does not match the DPoP proof');
+    r.req.dpopJkt = proofJkt;
+  }
+
+  const requestUri = `urn:ietf:params:oauth:request_uri:${rand()}`;
+  pushedRequests.set(requestUri, { ...r.req, expiresAt: Date.now() + PAR_EXPIRES_SEC * 1000 });
+  log(`PAR accepted from ${r.req.clientId}: ${requestUri}${proofJkt ? `, dpop_jkt=${proofJkt}` : ''}`);
+  sendJson(res, 201, { request_uri: requestUri, expires_in: PAR_EXPIRES_SEC });
+}
+
+function handlePushedAuthorize(res, params) {
+  const requestUri = params.get('request_uri');
+  const pushed = pushedRequests.get(requestUri);
+  pushedRequests.delete(requestUri); // one-time use: a leaked request_uri cannot be replayed
+  if (!pushed || pushed.expiresAt < Date.now()) {
+    log(`request_uri rejected: ${requestUri}`);
+    return errorPage(res, 'request_uri is invalid, expired, or has already been used');
+  }
+  // RFC 9126 §4: the request_uri is bound to the client that pushed it.
+  if (params.get('client_id') !== pushed.clientId) {
+    log(`request_uri rejected: pushed by ${pushed.clientId}, presented with client_id ${params.get('client_id')}`);
+    return errorPage(res, `client_id "${params.get('client_id')}" does not match the client that pushed this request`);
+  }
+  // RFC 9126 §4: only the pushed parameters count. Anything else in the URL (e.g. added by an attacker) is ignored.
+  const ignored = [...params].filter(([k]) => k !== 'client_id' && k !== 'request_uri');
+  if (ignored.length) log(`ignoring front-channel parameters next to request_uri: ${new URLSearchParams(ignored)}`);
+  const { expiresAt, ...req } = pushed;
+  showConsent(res, { ...req, par: { requestUri, ignored } });
 }
 
 async function handleDecision(req, res) {
@@ -412,6 +523,8 @@ async function handleToken(req, res) {
     if (form.redirect_uri !== grant.redirectUri) return tokenError('invalid_grant', 'redirect_uri does not match');
     const challenge = b64url(crypto.createHash('sha256').update(form.code_verifier ?? '').digest());
     if (challenge !== grant.codeChallenge) return tokenError('invalid_grant', 'PKCE verification failed');
+    // RFC 9449 §10: a code issued for a DPoP key (via PAR) can only be redeemed with that same key.
+    if (grant.dpopJkt && grant.dpopJkt !== jkt) return tokenError('invalid_grant', 'authorization code is bound to a different DPoP key');
   } else if (form.grant_type === 'refresh_token') {
     grant = refreshTokens.get(form.refresh_token);
     if (!grant || grant.expiresAt < Date.now()) {
@@ -662,6 +775,8 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { keys: [publicJwk] }, { 'cache-control': 'max-age=60' });
       case 'GET /authorize':
         return await handleAuthorize(res, url.searchParams);
+      case 'POST /par':
+        return await handlePar(req, res);
       case 'POST /authorize/decision':
         return await handleDecision(req, res);
       case 'POST /token':

@@ -23,6 +23,8 @@ const metadata = {
   response_types: ['code'],
   token_endpoint_auth_method: 'none',
   scope: 'openid profile email mcp:tools',
+  // RFC 9126 §6: this client always pushes its authorization requests, so the OP refuses ones sent via the browser's URL.
+  require_pushed_authorization_requests: true,
 };
 
 // A document whose client_id does not match its own URL (the OP must reject it).
@@ -140,42 +142,112 @@ async function requestToken(op, pairs, key) {
 async function handleLogin(res, variant) {
   const op = await discover();
   const variants = {
-    normal: {},
+    normal: { par: true },
     'unregistered-redirect': { redirectUri: `${BASE}/evil-callback` },
     'mismatched-client-id': { clientId: `${BASE}/mismatched-metadata.json` },
     'missing-document': { clientId: `${BASE}/not-found.json` },
     'no-path': { clientId: BASE },
-    'unknown-resource': { resources: [API_A, 'http://localhost:9999'] },
+    'unknown-resource': { par: true, resources: [API_A, 'http://localhost:9999'] },
+    // RFC 9126 PAR variants.
+    'no-par': {},
+    'par-tampered': {
+      par: true,
+      // Someone edits the URL in the browser. The OP must ignore all of this.
+      tamper: [
+        ['scope', 'openid profile email mcp:tools'],
+        ['resource', NOT_AUTHORIZED_RESOURCE],
+        ['redirect_uri', `${BASE}/evil-callback`],
+      ],
+    },
+    'par-replay': { par: true, replay: true },
+    'par-client-mismatch': { par: true, authorizeClientId: 'https://evil.example/client-metadata.json' },
   };
+  // The normal flow pushes its request (PAR). The other failure variants use the front channel on purpose,
+  // to show the OP's own checks on a request it receives through the browser.
   const {
     clientId = CLIENT_ID,
     redirectUri = REDIRECT_URI,
     resources = [API_A, API_B], // RFC 8707: ask for consent to both APIs up front
+    par = false,
+    ...parOptions
   } = variants[variant] || variants.normal;
 
   const nonce = rand(16);
   const q = new URLSearchParams({ client_id: clientId, redirect_uri: redirectUri, scope: 'openid profile email', nonce });
   for (const r of resources) q.append('resource', r);
-  redirectToAuthorize(res, op, q, { nonce, clientId, redirectUri }, variant || 'normal');
+  // The PAR request carries a DPoP proof too, which binds the authorization code to dpopKey (RFC 9449 §10.1).
+  await redirectToAuthorize(res, op, q, { nonce, clientId, redirectUri }, variant || 'normal', { par, key: dpopKey, ...parOptions });
+}
+
+// URLSearchParams -> plain object for display; repeated parameters (resource) become arrays.
+function formObject(params) {
+  const o = {};
+  for (const [k, v] of params) o[k] = k in o ? [].concat(o[k], v) : v;
+  return o;
 }
 
 // Adds state + PKCE to the authorization request, remembers the flow, and sends the browser to the OP.
-function redirectToAuthorize(res, op, query, flow, label) {
+// With `par`, the request is first pushed to the OP (RFC 9126) and the browser carries only client_id + request_uri.
+// tamper / replay / authorizeClientId break the PAR flow on purpose to show what the OP checks.
+async function redirectToAuthorize(res, op, query, flow, label, { par = false, key, tamper = [], replay = false, authorizeClientId } = {}) {
   const state = rand(16);
   const verifier = rand(32);
-  flows.set(state, { ...flow, verifier });
   query.set('response_type', 'code');
   query.set('state', state);
   query.set('code_challenge', b64url(crypto.createHash('sha256').update(verifier).digest()));
   query.set('code_challenge_method', 'S256');
   const u = new URL(op.authorization_endpoint);
-  u.search = query.toString();
+
+  let parTrace;
+  if (par) {
+    const endpoint = op.pushed_authorization_request_endpoint;
+    if (!endpoint) throw new Error('the authorization server does not offer a PAR endpoint');
+    const proof = key && createDpopProof(key, 'POST', endpoint);
+    // A public client authenticates at the PAR endpoint the same way as at the token endpoint: client_id only.
+    const r = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', ...(proof && { dpop: proof }) },
+      body: query,
+    });
+    parTrace = { endpoint, request: formObject(query), proof, status: r.status, body: await r.json() };
+    log(`PAR (${label}): HTTP ${r.status} ${JSON.stringify(parTrace.body)}`);
+    if (r.status !== 201) return parErrorPage(res, parTrace);
+
+    u.search = new URLSearchParams({ client_id: authorizeClientId ?? query.get('client_id'), request_uri: parTrace.body.request_uri });
+    for (const [k, v] of tamper) u.searchParams.append(k, v);
+    // Someone who saw the URL (e.g. in a log) uses the request_uri before the user does.
+    if (replay) await fetch(u.href, { redirect: 'manual' });
+    parTrace.authorizeUrl = u.href;
+  } else {
+    u.search = query.toString();
+  }
+
+  flows.set(state, { ...flow, verifier, par: parTrace });
   log(`redirecting to OP (${label}): ${u.href}`);
   send(res, 302, '', {
     location: u.href,
     // Cookies are not port-isolated, so use a name distinct from the OP's.
     'set-cookie': `rp_state=${state}; HttpOnly; SameSite=Lax; Path=/; Max-Age=600`,
   });
+}
+
+function parErrorPage(res, parTrace) {
+  html(
+    res,
+    `<div class="card err"><h1>PAR が OP に拒否されました</h1>
+<p><code>POST ${esc(parTrace.endpoint)}</code> <b>HTTP ${esc(parTrace.status)}</b></p>
+<p>送ったパラメーター:</p><pre>${json(parTrace.request)}</pre><p>レスポンス:</p><pre>${json(parTrace.body)}</pre>
+${hint(
+  'エラーがブラウザを経由せずに返ってくる',
+  `<p>PAR ではクライアントが OP に直接リクエストを送るので、エラーも JSON でそのままクライアントに返ってきます。
+ブラウザは OP の画面にすら移動していません。</p>
+<p>フロントチャネル (URL) で送った場合は、OP はエラーを <code>redirect_uri</code> 経由で返すか、
+redirect_uri が信用できなければ自分の画面に表示するしかありませんでした。
+PAR なら、ユーザーを OP に送る前に「このリクエストは受け付けられる」と確認できます。</p>`,
+  true,
+)}<a href="/">戻る</a></div>`,
+    400,
+  );
 }
 
 async function handleCallback(req, res, params) {
@@ -195,7 +267,8 @@ ${hint(
 <dt>access_denied</dt><dd>ユーザーが同意画面で「拒否」を押しました。</dd>
 <dt>invalid_target</dt><dd><code>resource</code> に、OP が知らない (または許可されていない) API を指定しました。</dd>
 <dt>invalid_scope</dt><dd>OP が対応していない scope を要求しました。</dd>
-<dt>invalid_request</dt><dd>必須のパラメーター (PKCE など) が足りません。</dd>
+<dt>invalid_request</dt><dd>必須のパラメーター (PKCE など) が足りません。
+または、PAR が必須のクライアント (メタデータに <code>require_pushed_authorization_requests: true</code>) が、PAR を使わずに URL でリクエストを送りました。</dd>
 </dl>`,
   true,
 )}
@@ -336,6 +409,7 @@ ${hint(
 </dl>
 <p>ID トークンを API に送ったり、アクセストークンを持っていることを「ログインした証拠」とみなしたりしてはいけません。</p>`,
 )}</div>
+${flow.par ? parCard(flow.par, proofClaims) : ''}
 ${step(
   '① 認可コード → トークン (resource=API A)',
   `<code>resource=${esc(API_A)}</code> を付けてトークンを要求`,
@@ -544,6 +618,35 @@ ${step(
   );
 }
 
+// Shows the pushed authorization request (RFC 9126) that started this flow.
+function parCard(par, proofClaims) {
+  const tampered = [...new URL(par.authorizeUrl).searchParams.keys()].some((k) => k !== 'client_id' && k !== 'request_uri');
+  return `<div class="card"><h2>⓪ PAR: 認可リクエストを OP に直接送る (RFC 9126)</h2>
+<p><code>POST ${esc(par.endpoint)}</code> ${statusBadge(par.status, 201)}</p>
+${hint(
+  '解説',
+  `<p>ログインボタンを押したとき、このアプリはブラウザを OP に移動させる <b>前に</b>、認可リクエストの中身を
+OP の <code>/par</code> に直接 POST しました。OP は client_id のメタデータ・redirect_uri・scope・resource・PKCE をここで検証し、
+中身を預かって <code>request_uri</code> (使い捨ての参照番号) を返します。</p>
+<p>ブラウザの URL に載るのは <code>client_id</code> と <code>request_uri</code> だけです。PAR を使わない場合と比べてみてください。</p>
+<dl>
+<dt>改ざんできない</dt><dd>URL に scope や redirect_uri を書き足しても、OP は POST された中身しか使いません。</dd>
+<dt>漏れない</dt><dd>要求内容がブラウザの履歴やアクセスログに残りません。</dd>
+<dt>先に検証できる</dt><dd>リクエストに誤りがあれば、ユーザーを OP に送る前に JSON のエラーで分かります。</dd>
+<dt>URL の長さを気にしなくてよい</dt><dd>パラメーターが多くても POST の本文なので問題ありません (RAR の <code>authorization_details</code> などで効いてきます)。</dd>
+</dl>
+<p>このリクエストには DPoP proof も付けています。OP はその鍵の thumbprint (<code>dpop_jkt</code>) を認可コードに紐付けるので、
+認可コードは ① で同じ鍵の proof を付けたときしかトークンに交換できません (RFC 9449 §10)。
+PKCE と同じく「コードを要求した本人しか使えない」ようにする仕組みです。</p>`,
+)}
+<p>送ったパラメーター (本文):</p><pre>${json(par.request)}</pre>
+${par.proof ? `<p>送った DPoP proof の中身:</p><pre>${json(proofClaims(par.proof))}</pre>` : ''}
+<p>レスポンス:</p><pre>${json(par.body)}</pre>
+<p>ブラウザが移動した URL:</p><pre>${esc(par.authorizeUrl)}</pre>
+${tampered ? `<p class="err card">URL に <code>request_uri</code> 以外のパラメーターを書き足しましたが、OP の同意画面にも、発行されたトークンにも反映されていません (OP が無視した)。
+アクセストークンの <code>aud</code> や <code>scope</code> が、上の「送ったパラメーター」どおりであることを確認してください。</p>` : ''}</div>`;
+}
+
 // --- MCP-style flow: start from nothing but the MCP server URL --------------
 // MCP authorization spec: 401 + WWW-Authenticate -> Protected Resource Metadata (RFC 9728)
 // -> Authorization Server Metadata (RFC 8414) -> authorize with CIMD + PKCE + resource (RFC 8707).
@@ -675,7 +778,11 @@ async function handleMcpLogin(res, endpoint) {
   log(`MCP discovery: ${endpoint} -> resource=${d.resource}, as=${d.as.issuer}, scope="${d.scope}"`);
   // Same CIMD client_id as the OIDC flow: the OP has never seen this client, and does not need to.
   const q = new URLSearchParams({ client_id: CLIENT_ID, redirect_uri: REDIRECT_URI, scope: d.scope, resource: d.resource });
-  redirectToAuthorize(res, d.as, q, { clientId: CLIENT_ID, redirectUri: REDIRECT_URI, mcp: { endpoint, ...d } }, 'mcp');
+  // This client requires PAR for itself (see its metadata), so it pushes the request whenever the AS offers PAR.
+  // No DPoP key here: the MCP authorization spec uses Bearer tokens.
+  await redirectToAuthorize(res, d.as, q, { clientId: CLIENT_ID, redirectUri: REDIRECT_URI, mcp: { endpoint, ...d } }, 'mcp', {
+    par: Boolean(d.as.pushed_authorization_request_endpoint),
+  });
 }
 
 const traceCards = (trace, start = 1) =>
@@ -703,7 +810,23 @@ async function handleMcpCallback(res, params, flow, as) {
     ['resource', resource],
   ]);
   const at = t.body.access_token;
-  const steps = [
+  const steps = [];
+  if (flow.par) {
+    steps.push({
+      title: '認可リクエストを PAR で送る (RFC 9126)',
+      req: `POST ${flow.par.endpoint}`,
+      status: flow.par.status,
+      expected: 201,
+      note: `ブラウザが移動した URL: <code>${esc(flow.par.authorizeUrl)}</code>`,
+      hint: `<p>認可サーバーのメタデータに <code>pushed_authorization_request_endpoint</code> があったので、
+認可リクエストの中身 (scope・resource・PKCE など) を先に OP へ直接 POST し、<code>request_uri</code> を受け取りました。
+ブラウザの URL には <code>client_id</code> と <code>request_uri</code> だけが載ります。</p>
+<p>このクライアントは CIMD のメタデータに <code>require_pushed_authorization_requests: true</code> と書いているので、
+PAR を使わないリクエストは OP に拒否されます。</p>`,
+      body: { request: flow.par.request, response: flow.par.body },
+    });
+  }
+  steps.push(
     {
       title: 'トークンリクエスト (CIMD client_id + PKCE + resource)',
       req: `POST ${as.token_endpoint}  resource=${resource}`,
@@ -716,7 +839,7 @@ async function handleMcpCallback(res, params, flow, as) {
 「ログインしたのは誰か」をアプリが知る必要は無いので、ID トークン (OIDC) は使いません。</p>`,
       body: at ? { access_token_claims: decodeJwt(at).payload, response: t.body } : t.body,
     },
-  ];
+  );
   if (!at) return html(res, `<div class="card err"><h1>トークンリクエスト失敗</h1></div>${traceCards([...trace, ...steps])}`, 400);
 
   // 5) Talk MCP with the token.
@@ -818,7 +941,8 @@ OP は初めて見るアプリでも、その URL を取りに行けば名前・
 <p>このクライアントは OP に事前登録されていません。<br>
 client_id = <code><a href="/client-metadata.json">${esc(CLIENT_ID)}</a></code></p>
 <p><a class="btn" href="/login">OP でログイン</a></p>
-<p>ログイン後、Resource Indicators (RFC 8707) で API ごとに <code>aud</code> を絞ったアクセストークンを取得し、
+<p>認可リクエストは PAR (RFC 9126) で OP に直接送り、ブラウザの URL には <code>request_uri</code> だけを載せます。
+ログイン後、Resource Indicators (RFC 8707) で API ごとに <code>aud</code> を絞ったアクセストークンを取得し、
 <code>${esc(API_A)}</code> / <code>${esc(API_B)}</code> を呼び分けます。
 トークンは DPoP (RFC 9449) でこのアプリの鍵に紐付け、盗まれたトークンが使えないことも確認します。
 最後に、API A がユーザーの代わりに API B を呼ぶ Token Exchange (RFC 8693) も試します。</p>
@@ -874,6 +998,9 @@ ${hint(
 <dt>token_endpoint_auth_method: none</dt><dd>クライアントシークレット (アプリのパスワード) を使わない「公開クライアント」であることを示します。
 この JSON は誰でも読めるので、秘密は書けません。代わりに PKCE で安全性を確保します。</dd>
 <dt>scope</dt><dd>このアプリが要求する可能性のある権限の一覧です。</dd>
+<dt>require_pushed_authorization_requests: true</dt><dd>このアプリは必ず PAR (RFC 9126) で認可リクエストを送る、という宣言です。
+OP は、このアプリの client_id でブラウザの URL から直接届いた認可リクエストを拒否します。
+攻撃者が URL を組み立てて、このアプリになりすましたリクエストをユーザーに踏ませることも難しくなります。</dd>
 </dl>`,
 )}</div>
 <div class="card"><h1>失敗パターンを試す</h1><ul>
@@ -893,9 +1020,27 @@ ${hint(
 <dt>パスの無い client_id URL</dt><dd>仕様で、client_id の URL にはパス (<code>/client-metadata.json</code> など) が必須と決められています。</dd>
 <dt>OP が知らない resource</dt><dd>OP が管理していない API 向けのトークンは発行しません。</dd>
 </dl>
-<p>最初の 4 つは OP の画面でエラーになり、クライアントには戻りません。
-戻り先 (redirect_uri) が信用できるとまだ確認できていないので、そこへエラーを送るのも危険だからです。
-最後の 1 つは戻り先の確認後なので、<code>error=invalid_target</code> としてクライアントに返されます。</p>`,
+<p>最初の 4 つは OP の動きを見るため、あえて PAR を使わずブラウザの URL で送っています。OP の画面でエラーになり、クライアントには戻りません。
+戻り先 (redirect_uri) が信用できるとまだ確認できていないので、そこへエラーを送るのも危険だからです。</p>
+<p>最後の 1 つは PAR で送っているので、ブラウザを OP に移動させる前に <code>invalid_target</code> が JSON で直接クライアントに返されます。</p>`,
+)}</div>
+<div class="card"><h1>PAR (RFC 9126) の動きを試す</h1><ul>
+<li><a href="/login?variant=no-par">PAR を使わずに、従来どおり URL で認可リクエストを送る</a></li>
+<li><a href="/login?variant=par-tampered">PAR の後、ブラウザの URL に scope・resource・redirect_uri を書き足す</a></li>
+<li><a href="/login?variant=par-replay">request_uri を他の誰かが先に使う (再利用)</a></li>
+<li><a href="/login?variant=par-client-mismatch">request_uri を別の client_id と組み合わせる</a></li>
+</ul>
+${hint(
+  'それぞれ何が起きる?',
+  `<dl>
+<dt>PAR を使わない</dt><dd>URL に全パラメーターが並びます (OP に移動したらアドレスバーを見てください)。
+このアプリはメタデータで PAR を必須にしているので、OP は <code>error=invalid_request</code> でクライアントに返します。</dd>
+<dt>URL に書き足す</dt><dd>OP は <code>request_uri</code> が指す POST 済みの中身しか使わないので、書き足した値は無視されます。
+同意画面に「無視しました」と表示され、ログインはそのまま成功します。発行されたトークンの scope や aud を確認してください。</dd>
+<dt>request_uri の再利用</dt><dd><code>request_uri</code> は 1 回しか使えません。ここではクライアントが先に一度使ってからブラウザを送るので、OP はエラー画面を表示します。</dd>
+<dt>別の client_id と組み合わせる</dt><dd><code>request_uri</code> は PAR を送ったクライアントに紐付いています。他のクライアントを名乗って使うことはできません。</dd>
+</dl>
+<p>「失敗パターンを試す」の <b>OP が知らない resource を要求する</b> も PAR で送っています。エラーが JSON で直接クライアントに返る様子が見られます。</p>`,
 )}</div>
 <div class="card"><p>OP: <a href="${esc(ISSUER)}/">${esc(ISSUER)}</a> (キャッシュ状況) ・
 <a href="${esc(ISSUER)}/.well-known/openid-configuration">discovery</a></p></div>`,
